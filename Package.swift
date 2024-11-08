@@ -36,7 +36,7 @@ linkerSettings.append(.linkedFramework("Accelerate"))
 cSettings.append(
     contentsOf: [
         .define("GGML_USE_ACCELERATE"),
-        .define("GGML_USE_METAL")
+//        .define("GGML_USE_METAL")
     ]
 )
 #endif
