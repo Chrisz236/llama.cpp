@@ -6786,6 +6786,125 @@ static void ggml_graph_dump_dot_leaf_edge(FILE * fp, struct ggml_tensor * node, 
             label);
 }
 
+void ggml_graph_dump_dot_stdout(const struct ggml_cgraph * gb, const struct ggml_cgraph * gf, const char * filename) {
+    char color[16];
+    
+    printf("digraph G {\n");
+    printf("  newrank = true;\n");
+    printf("  rankdir = TB;\n");
+    
+    for (int i = 0; i < gb->n_nodes; i++) {
+        struct ggml_tensor * node = gb->nodes[i];
+        
+        if (ggml_graph_get_parent(gb, node) != NULL) {
+            continue;
+        }
+        
+        if (node->flags & GGML_TENSOR_FLAG_PARAM) {
+            snprintf(color, sizeof(color), "yellow");
+        } else if (node->grad) {
+            if (ggml_graph_find(gf, node)) {
+                snprintf(color, sizeof(color), "green");
+            } else {
+                snprintf(color, sizeof(color), "lightblue");
+            }
+        } else {
+            snprintf(color, sizeof(color), "white");
+        }
+        
+        printf("  \"%p\" [ "
+               "style = filled; fillcolor = %s; shape = record; "
+               "label=\"",
+               (void *) node, color);
+        
+        if (strlen(node->name) > 0) {
+            printf("%s (%s)|in_degree=%d|", node->name, ggml_type_name(node->type), node->in_degree);
+        } else {
+            printf("(%s)|in_degree=%d|", ggml_type_name(node->type), node->in_degree);
+        }
+        
+        if (ggml_is_matrix(node)) {
+            printf("%d [%" PRId64 ", %" PRId64 "] | <x>%s", i, node->ne[0], node->ne[1], ggml_op_symbol(node->op));
+        } else {
+            printf("%d [%" PRId64 ", %" PRId64 ", %" PRId64 "] | <x>%s", i, node->ne[0], node->ne[1], node->ne[2], ggml_op_symbol(node->op));
+        }
+        
+        if (node->grad) {
+            printf(" | <g>%s\"; ]\n", ggml_op_symbol(node->grad->op));
+        } else {
+            printf("\"; ]\n");
+        }
+    }
+    
+    for (int i = 0; i < gb->n_leafs; i++) {
+        struct ggml_tensor * node = gb->leafs[i];
+        
+        snprintf(color, sizeof(color), "pink");
+        
+        printf("  \"%p\" [ "
+               "style = filled; fillcolor = %s; shape = record; "
+               "label=\"<x>",
+               (void *) node, color);
+        
+        if (strlen(node->name) > 0) {
+            printf("%s (%s)|in_degree=%d|", node->name, ggml_type_name(node->type), node->in_degree);
+        } else {
+            printf("(%s)|in_degree=%d|", ggml_type_name(node->type), node->in_degree);
+        }
+        
+        printf("CONST %d [%" PRId64 ", %" PRId64 "]", i, node->ne[0], node->ne[1]);
+        if (ggml_nelements(node) < 5 && node->data != NULL) {
+            printf(" | (");
+            for (int j = 0; j < ggml_nelements(node); j++) {
+                // FIXME: use ggml-backend to obtain the tensor data
+                //if (node->type == GGML_TYPE_I8 || node->type == GGML_TYPE_I16 || node->type == GGML_TYPE_I32) {
+                //    fprintf(fp, "%d", ggml_get_i32_1d(node, j));
+                //}
+                //else if (node->type == GGML_TYPE_F32 ||
+                //         node->type == GGML_TYPE_F16 ||
+                //         node->type == GGML_TYPE_BF16) {
+                //    fprintf(fp, "%.1e", (double)ggml_get_f32_1d(node, j));
+                //}
+                //else
+                {
+                    printf("#");
+                }
+                if (j < ggml_nelements(node) - 1) {
+                    printf(", ");
+                }
+            }
+            printf(")");
+        }
+        printf("\"; ]\n");
+    }
+    
+    for (int i = 0; i < gb->n_nodes; i++) {
+        struct ggml_tensor * node = gb->nodes[i];
+        
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) {
+                char label[16];
+                snprintf(label, sizeof(label), "src %d", j);
+                ggml_graph_dump_dot_node_edge(stdout, gb, node, node->src[j], label);
+            }
+        }
+    }
+    
+    for (int i = 0; i < gb->n_leafs; i++) {
+        struct ggml_tensor * node = gb->leafs[i];
+        
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (node->src[j]) {
+                char label[16];
+                snprintf(label, sizeof(label), "src %d", j);
+                ggml_graph_dump_dot_leaf_edge(stdout, node, node->src[j], label);
+            }
+        }
+    }
+    
+    printf("}\n");
+}
+
 void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph * gf, const char * filename) {
     char color[16];
 
