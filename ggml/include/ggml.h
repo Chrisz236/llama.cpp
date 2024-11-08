@@ -615,7 +615,22 @@ extern "C" {
 
         void * extra; // extra things e.g. for ggml-cuda.cu
 
-        // char padding[4];
+        // because llama.cpp has memory align requirement of 16x bytes
+        // 4+1 bytes
+        int32_t in_degree;
+        bool visited;
+        
+        // 1 byte
+        bool executed;
+        
+        // 1 bytes
+        bool is_last;
+        
+        // 16 bytes (2 pointers inside)
+        struct ggml_child_tensor_list * children;
+        
+        // 9 bytes
+        char padding[9];
     };
 
     static const size_t GGML_TENSOR_SIZE = sizeof(struct ggml_tensor);
