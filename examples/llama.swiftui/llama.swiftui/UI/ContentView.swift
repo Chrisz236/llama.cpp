@@ -50,14 +50,15 @@ struct ContentView: View {
 
             }
             .padding()
-            .navigationBarTitle("Model Settings", displayMode: .inline)
+            .navigationBarTitle("Model Settings - Optimized version", displayMode: .inline)
 
         }
     }
 
     func sendText() {
         Task {
-            await llamaState.complete(text: multiLineText)
+            await llamaState.complete(text: "The meaning of the life is")
+//            await llamaState.complete(text: multiLineText)
             multiLineText = ""
         }
     }
@@ -135,11 +136,5 @@ struct ContentView: View {
                    }
             }
         }
-    }
-}
-
-struct ContentView_Previews: PreviewProvider {
-    static var previews: some View {
-        ContentView()
     }
 }

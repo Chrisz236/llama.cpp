@@ -32,7 +32,7 @@ actor LlamaContext {
     /// This variable is used to store temporarily invalid cchars
     private var temporary_invalid_cchars: [CChar]
 
-    var n_len: Int32 = 1024
+    var n_len: Int32 = 128
     var n_cur: Int32 = 0
 
     var n_decode: Int32 = 0
@@ -70,15 +70,41 @@ actor LlamaContext {
             print("Could not load model at \(path)")
             throw LlamaError.couldNotInitializeContext
         }
-
-        let n_threads = max(1, min(8, ProcessInfo.processInfo.processorCount - 2))
+        
+        // n_threads -> number of threads for threadpool
+//        let n_threads = max(1, min(8, ProcessInfo.processInfo.processorCount - 2))
+        
+//        2 P cores (lower utilized) (18 tk/s)
+//        let n_threads = 1
+        
+//        2 P cores (highly utilized) (26 tk/s)
+        let n_threads = 2
+        
+//        2 P cores (highy utilized) + 1 E core (lower utilized) (29 tk/s)
+//        let n_threads = 3
+        
+//        2 P cores (highly utilized) + 2 E cores (lower utilized) (32 tk/s)
+//        let n_threads = 4
+        
+//        2 P cores (highly utilized) + 3 E cores (lower utilized) (29 tk/s)
+//        let n_threads = 5
+        
+//        2 P cores (highly utilized) + 4 E cores (lower utilized) ((23 tk/s)
+//        let n_threads = 6
+        
+//        All cores highly occupied, slow(2 tk/s) :(
+//        let n_threads = 7
+        
+// I guess the reason why when n_threads > 4 become slower is memory bottleneck?
         print("Using \(n_threads) threads")
 
         var ctx_params = llama_context_default_params()
         ctx_params.n_ctx = 2048
         ctx_params.n_threads       = Int32(n_threads)
         ctx_params.n_threads_batch = Int32(n_threads)
-
+        
+        ctx_params.flash_attn = true
+        
         let context = llama_new_context_with_model(model, ctx_params)
         guard let context else {
             print("Could not load context!")

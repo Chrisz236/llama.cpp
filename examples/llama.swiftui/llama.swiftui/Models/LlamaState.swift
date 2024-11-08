@@ -64,6 +64,24 @@ class LlamaState: ObservableObject {
         return paths[0]
     }
     private let defaultModels: [Model] = [
+        Model(
+            name: "Llama3-8B (Q4_0, 4.92 GiB)",
+            url: "https://huggingface.co/bartowski/Meta-Llama-3-8B-Instruct-GGUF/resolve/main/Meta-Llama-3-8B-Instruct-Q4_K_M.gguf?download=true",
+            filename: "llama3-8B-chat.gguf", status: "download"
+        ),
+        
+        Model(
+            name: "Llama3.2-1B (Q4_0, 0.8 GiB)",
+            url: "https://huggingface.co/hugging-quants/Llama-3.2-1B-Instruct-Q4_K_M-GGUF/resolve/main/llama-3.2-1b-instruct-q4_k_m.gguf?download=true",
+            filename: "llama3.2-1B-chat-q4.gguf", status: "download"
+        ),
+        
+        Model(
+            name: "Llama3.2-1B (F16, 2.48 GiB)",
+            url: "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-f16.gguf?download=true",
+            filename: "llama3.2-1B-chat-f16.gguf", status: "download"
+        ),
+        
         Model(name: "TinyLlama-1.1B (Q4_0, 0.6 GiB)",url: "https://huggingface.co/TheBloke/TinyLlama-1.1B-1T-OpenOrca-GGUF/resolve/main/tinyllama-1.1b-1t-openorca.Q4_0.gguf?download=true",filename: "tinyllama-1.1b-1t-openorca.Q4_0.gguf", status: "download"),
         Model(
             name: "TinyLlama-1.1B Chat (Q8_0, 1.1 GiB)",
