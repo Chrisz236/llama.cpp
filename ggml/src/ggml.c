@@ -6143,6 +6143,159 @@ static void ggml_compute_backward(struct ggml_context * ctx, struct ggml_tensor 
     }
 }
 
+// Function to add a node to the ggml_child_tensor_list at the tail
+static void ggml_add_child_tensor(struct ggml_tensor *src, struct ggml_tensor *current) {
+    struct ggml_child_tensor_list *new_child = (struct ggml_child_tensor_list *)malloc(sizeof(struct ggml_child_tensor_list));
+    if (!new_child) {
+        // Handle allocation failure
+        return;
+    }
+    
+    new_child->child = current;
+    new_child->next = NULL;
+    
+    // If the list is empty, make the new child the head
+    if (!src->children) {
+        src->children = new_child;
+    } else {
+        // Traverse to the last node
+        struct ggml_child_tensor_list *last = src->children;
+        while (last->next) {
+            last = last->next;
+        }
+        // Add the new child at the end
+        last->next = new_child;
+    }
+}
+
+// Hash map entry for tracking pointers
+struct hash_entry {
+    void *data_ptr;
+    struct hash_entry *next;
+};
+
+// Hash map structure with a size equal to the number of nodes in the compute graph
+struct ptr_hash_map {
+    struct hash_entry **table;
+    int size;
+};
+
+// Initialize hash map with a size equal to n_nodes
+struct ptr_hash_map *initialize_hash_map(int n_nodes) {
+    struct ptr_hash_map *map = (struct ptr_hash_map *)malloc(sizeof(struct ptr_hash_map));
+    map->table = (struct hash_entry **)calloc(n_nodes, sizeof(struct hash_entry *));
+    map->size = n_nodes;
+    return map;
+}
+
+// Hash function based on pointer
+size_t hash_function(void *ptr, int map_size) {
+    return ((size_t)ptr) % map_size;
+}
+
+// Check if data pointer exists in the hash map
+bool exists_in_map(struct ptr_hash_map *map, void *ptr) {
+    size_t index = hash_function(ptr, map->size);
+    struct hash_entry *entry = map->table[index];
+    while (entry) {
+        if (entry->data_ptr == ptr) {
+            return true;
+        }
+        entry = entry->next;
+    }
+    return false;
+}
+
+// Insert data pointer into hash map
+void insert_into_map(struct ptr_hash_map *map, void *ptr) {
+    size_t index = hash_function(ptr, map->size);
+    struct hash_entry *new_entry = (struct hash_entry *)malloc(sizeof(struct hash_entry));
+    new_entry->data_ptr = ptr;
+    new_entry->next = map->table[index];
+    map->table[index] = new_entry;
+}
+
+// Free hash map memory
+void free_hash_map(struct ptr_hash_map *map) {
+    for (int i = 0; i < map->size; i++) {
+        struct hash_entry *entry = map->table[i];
+        while (entry) {
+            struct hash_entry *temp = entry;
+            entry = entry->next;
+            free(temp);
+        }
+    }
+    free(map->table);
+    free(map);
+}
+
+// Helper function to calculate data size based on tensor dimensions and type
+size_t calculate_data_size(struct ggml_tensor *node) {
+    size_t element_size = ggml_type_size(node->type);
+    return element_size * node->ne[0] * node->ne[1] * node->ne[2] * node->ne[3];
+}
+
+// Function to allocate space for the tensor's data based on its type and dimensions
+void *allocate_tensor_data(struct ggml_tensor *node) {
+    return malloc(ggml_nbytes(node));
+}
+
+static void update_child_data(struct ggml_tensor * tensor) {
+    struct ggml_child_tensor_list *child = tensor->children;
+    while (child) {
+        if (child->child->op == GGML_OP_RESHAPE) {
+            child->child->data = tensor->data;
+        }
+        child = child->next;
+    }
+}
+
+// Helper recursive DFS function without external hash set
+static void ggml_update_in_degree_dfs(struct ggml_tensor *node, struct ptr_hash_map *data_map) {
+    if (node->visited) {
+        return;
+    }
+    
+    node->visited = true;
+    
+    if (node->op == GGML_OP_MUL_MAT) {
+        if (exists_in_map(data_map, node->data)) {
+//            printf("Shared data pointer detected! Node [%s]\n", node->name);
+            free(node->data);
+            node->data = allocate_tensor_data(node);
+//            printf("Assigned address: %p\n", node->data);
+            update_child_data(node);
+        } else {
+            insert_into_map(data_map, node->data);
+        }
+    }
+    
+    for (int i = 0; i < GGML_MAX_SRC; ++i) {
+        if (node->src[i]) {
+            if (node->src[i]->op != GGML_OP_NONE){
+                node->in_degree++;
+                ggml_add_child_tensor(node->src[i], node);
+                ggml_update_in_degree_dfs(node->src[i], data_map);
+            }
+        }
+    }
+}
+
+static void scan_buffer(struct ggml_cgraph *cgraph) {
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        printf("[%s], Buffer: %p\n", cgraph->nodes[i]->name, cgraph->nodes[i]->buffer);
+    }
+}
+
+// Helper function setup in_degree for nodes in compute graph
+static void ggml_set_in_degree(struct ggml_cgraph *cgraph, struct ggml_tensor *node) {
+    struct ptr_hash_map *data_map = initialize_hash_map(cgraph->n_nodes);
+    for (int i = cgraph->n_nodes - 1; i >= 0; i--) {
+        ggml_update_in_degree_dfs(cgraph->nodes[i], data_map);
+    }
+    free_hash_map(data_map);
+}
+
 static void ggml_visit_parents(struct ggml_cgraph * cgraph, struct ggml_tensor * node) {
     if (node->grad == NULL) {
         // this usually happens when we generate intermediate nodes from constants in the backward pass
@@ -6186,6 +6339,10 @@ static void ggml_visit_parents(struct ggml_cgraph * cgraph, struct ggml_tensor *
 
         cgraph->nodes[cgraph->n_nodes] = node;
         cgraph->n_nodes++;
+    }
+    
+    if (node->is_last) {
+        ggml_set_in_degree(cgraph, node);
     }
 }
 

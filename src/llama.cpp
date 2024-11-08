@@ -10714,7 +10714,7 @@ struct llm_build_context {
         }
 
         cb(cur, "result_output", -1);
-
+        cur->is_last = true;
         ggml_build_forward_expand(gf, cur);
 
         return gf;

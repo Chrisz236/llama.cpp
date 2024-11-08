@@ -580,6 +580,12 @@ extern "C" {
         bool   no_alloc;   // don't allocate memory for the tensor data
     };
 
+    // Linked list structure for connected child nodes
+    struct ggml_child_tensor_list {
+        struct ggml_tensor *child;     // Pointer to child tensor
+        struct ggml_child_tensor_list *next;    // Pointer to the next child in the list
+    };
+
     // n-dimensional tensor
     struct ggml_tensor {
         enum ggml_type type;
