@@ -2058,7 +2058,7 @@ extern "C" {
     // dump the graph into a file using the dot format
     GGML_API void ggml_graph_dump_dot(const struct ggml_cgraph * gb, const struct ggml_cgraph * gf, const char * filename);
 
-    // dump the graph into a file using the dot format
+    // dump the graph into a stdout using the dot format
     GGML_API void ggml_graph_dump_dot_stdout(const struct ggml_cgraph * gb, const struct ggml_cgraph * gf, const char * filename);
 
     // build gradient checkpointing backward graph gb for gf using provided checkpoints

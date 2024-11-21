@@ -6235,11 +6235,6 @@ size_t calculate_data_size(struct ggml_tensor *node) {
     return element_size * node->ne[0] * node->ne[1] * node->ne[2] * node->ne[3];
 }
 
-// Function to allocate space for the tensor's data based on its type and dimensions
-void *allocate_tensor_data(struct ggml_tensor *node) {
-    return malloc(ggml_nbytes(node));
-}
-
 static void update_child_data(struct ggml_tensor * tensor) {
     struct ggml_child_tensor_list *child = tensor->children;
     while (child) {
@@ -6262,7 +6257,7 @@ static void ggml_update_in_degree_dfs(struct ggml_tensor *node, struct ptr_hash_
         if (exists_in_map(data_map, node->data)) {
 //            printf("Shared data pointer detected! Node [%s]\n", node->name);
             free(node->data);
-            node->data = allocate_tensor_data(node);
+            node->data = malloc(ggml_nbytes(node));
 //            printf("Assigned address: %p\n", node->data);
             update_child_data(node);
         } else {
