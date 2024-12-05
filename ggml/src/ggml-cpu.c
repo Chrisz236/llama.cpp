@@ -1344,8 +1344,7 @@ struct ggml_threadpool {
     
     enum ggml_status ec;
     
-    struct ggml_ready_queue * working_queue;
-    struct ggml_subpool subpools[GGML_SUBPOOL_COUNT]; // 2 subpools, each with 2 threads
+    struct ggml_ready_queue * working_queue;  // Shared queue between main thread and worker threads
 };
 
 // Per-thread state
@@ -13577,28 +13576,27 @@ static inline bool ggml_graph_compute_check_for_work(struct ggml_compute_state *
 }
 
 // ------ THREAD SAFE QUEUE -------
-// Have to move here to make sure it was defined
 // Node structure
 struct ggml_queue_node {
-    struct ggml_tensor *tensor;
-    struct ggml_queue_node *next;
+    struct ggml_tensor * tensor;
+    struct ggml_queue_node * next;
 };
 
 // Queue structure
 struct ggml_ready_queue {
-    struct ggml_queue_node *front;
-    struct ggml_queue_node *rear;
+    struct ggml_queue_node * front;
+    struct ggml_queue_node * rear;
     int size;
-    bool all_mul_mat;
     ggml_mutex_t mutex; // Mutex for thread-safety
+    struct ggml_queue_node * current;
 };
 
 // Initialize the queue
 void init_queue(struct ggml_ready_queue *q) {
     q->front = q->rear = NULL;
     q->size = 0;
-    q->all_mul_mat = true;
-    ggml_mutex_init(&q->mutex); // Initialize the mutex
+    q->current = NULL;
+    ggml_mutex_init(&q->mutex);
 }
 
 // Enqueue operation
@@ -13611,25 +13609,20 @@ void enqueue(struct ggml_ready_queue *q, struct ggml_tensor *tensor) {
 
     if (!q->rear) {
         q->front = q->rear = new_node;
+        if (!q->current) {
+            q->current = new_node; // Update current if queue was empty
+        }
     } else {
         q->rear->next = new_node;
         q->rear = new_node;
     }
 
     q->size++; // Increment size
-
-    // Update `all_mul_mat` if necessary
-    if (tensor->op != GGML_OP_MUL_MAT) {
-        q->all_mul_mat = false;
-    } else if (q->size == 1) {
-        q->all_mul_mat = true;
-    }
-
     ggml_mutex_unlock(&q->mutex); // Unlock the mutex
 }
 
 // Dequeue operation
-struct ggml_tensor * dequeue(struct ggml_ready_queue *q) {
+struct ggml_tensor * dequeue(struct ggml_ready_queue * q) {
     ggml_mutex_lock(&q->mutex); // Lock the mutex
 
     if (!q->front) {
@@ -13637,8 +13630,8 @@ struct ggml_tensor * dequeue(struct ggml_ready_queue *q) {
         return NULL;
     }
 
-    struct ggml_queue_node *temp = q->front;
-    struct ggml_tensor *tensor = temp->tensor;
+    struct ggml_queue_node * temp = q->front;
+    struct ggml_tensor * tensor = temp->tensor;
     q->front = q->front->next;
 
     if (!q->front) {
@@ -13646,30 +13639,28 @@ struct ggml_tensor * dequeue(struct ggml_ready_queue *q) {
     }
 
     q->size--; // Decrement size
-    free(temp);
+
+    // Update the current pointer if it points to the node being dequeued
+    if (q->current == temp) {
+        q->current = q->front;
+    }
+
+    free(temp); // Free the dequeued node
 
     ggml_mutex_unlock(&q->mutex); // Unlock the mutex
     return tensor;
 }
 
-// Check if the queue is empty
-bool is_queue_empty(struct ggml_ready_queue *q) {
-    ggml_mutex_lock(&q->mutex); // Lock the mutex
-    bool empty = (q->front == NULL);
-    ggml_mutex_unlock(&q->mutex); // Unlock the mutex
-    return empty;
-}
-
-// Get the queue size
-int get_queue_size(struct ggml_ready_queue *q) {
+// Get queue size
+int get_size(struct ggml_ready_queue * q) {
     ggml_mutex_lock(&q->mutex); // Lock the mutex
     int size = q->size;
     ggml_mutex_unlock(&q->mutex); // Unlock the mutex
     return size;
 }
 
-// Destroy the queue
-void destroy_queue(struct ggml_ready_queue *q) {
+// Free the entire queue
+void free_queue(struct ggml_ready_queue * q) {
     ggml_mutex_lock(&q->mutex); // Lock the mutex
 
     // Free all nodes in the queue
@@ -13680,17 +13671,43 @@ void destroy_queue(struct ggml_ready_queue *q) {
     }
 
     q->rear = NULL;
+    q->current = NULL;
     q->size = 0;
 
     ggml_mutex_unlock(&q->mutex); // Unlock the mutex
     ggml_mutex_destroy(&q->mutex); // Destroy the mutex
 }
+
+
+bool is_queue_empty(struct ggml_ready_queue * q) {
+    return get_size(q) == 0;
+}
+
+// Peek one node without dequeueing
+struct ggml_tensor *peek_one(struct ggml_ready_queue *q) {
+    struct ggml_tensor *tensor = NULL;
+
+    ggml_mutex_lock(&q->mutex); // Lock the mutex
+
+    if (q->current) {
+        tensor = q->current->tensor;
+        q->current = q->current->next; // Move to the next node
+    } else {
+        // Reset to front if current is NULL (e.g., queue updated by enqueue)
+        q->current = q->front;
+    }
+
+    ggml_mutex_unlock(&q->mutex); // Unlock the mutex
+
+    return tensor;
+}
+
 // -------- QUEUE ---------
 
 static thread_ret_t ggml_graph_compute_worker_thread(void *data) {
-    struct ggml_compute_state *state = (struct ggml_compute_state *) data;
-    struct ggml_threadpool *tp = state->threadpool;
-    struct ggml_ready_queue * queue = NULL;
+    struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+    struct ggml_threadpool * tp = state->threadpool;
+    struct ggml_ready_queue * working_queue = tp->working_queue;
     
     void *local_work_data = malloc(tp->cplan->work_size);
     if (!local_work_data) {
@@ -13698,10 +13715,9 @@ static thread_ret_t ggml_graph_compute_worker_thread(void *data) {
         perror("Failed to allocate memory for local_work_data");
         return -1;
     }
-
+    
     
     while (true) {
-        queue = tp->working_queue;
         bool stop_flag = atomic_load(&tp->stop);
         if (stop_flag) {
             break;
@@ -13709,107 +13725,121 @@ static thread_ret_t ggml_graph_compute_worker_thread(void *data) {
         
         struct ggml_tensor * tensor = NULL;
         
-        while ((tensor = dequeue(queue)) == NULL) {
-            queue = tp->working_queue;
+        // Spin-wait to get a node from the queue using peek_one
+        while ((tensor = peek_one(working_queue)) == NULL) {
             stop_flag = atomic_load(&tp->stop);
             if (stop_flag) {
-                break;
+                break; // Exit if stop flag is set during spin-wait
             }
+            ggml_thread_cpu_relax(); // Yield CPU to reduce busy-wait overhead
         }
-
+        
         if (stop_flag) {
             break;
         }
         
+        ggml_mutex_lock(&tp->working_queue->mutex);
+        if (tensor->executed) {
+            ggml_mutex_unlock(&tp->working_queue->mutex);
+            continue;
+        }
+        ggml_mutex_unlock(&tp->working_queue->mutex);
+        
         printf("\t- Worker thread %d got node [%s]\n", state->ith, tensor->name);
+        
         struct ggml_compute_params params = {
             .ith = 0,
-            .nth = 1, // Number of threads to use for this node
-            .wsize = tp->cplan->work_size,  // wsize here is maximum intermediate bytes it needed
-            .wdata = local_work_data, // since we are multi-issue, seperate memeory space for those intermediate values
-            .threadpool = tp,             // we use this as flag to determine if current run is issued from subpool or global pool
+            .nth = 1,
+            .wsize = tp->cplan->work_size,
+            .wdata = local_work_data,
+            .threadpool = tp,
             .sub_threadpool = NULL,
         };
         
         ggml_compute_forward(&params, tensor);
+        
+        ggml_mutex_lock(&tp->working_queue->mutex);
+        tensor->executed = true;
+        printf("\t- Worker thread %d executed node [%s]\n", state->ith, tensor->name);
+        ggml_mutex_unlock(&tp->working_queue->mutex);
     }
     
 //    free(local_work_data);
     return 0;
 }
 
-static thread_ret_t ggml_graph_compute_secondary_thread_subpool(void *data) {
-    struct ggml_compute_state *state = (struct ggml_compute_state *) data;
-    struct ggml_threadpool *tp = state->threadpool;
-    int subpool_id = state->ith % GGML_SUBPOOL_COUNT;  // thread 1 -> pool 1; thread 2 -> pool 0; thread 3 -> pool 1; thread 4 -> pool 0
-    struct ggml_subpool *subpool = &tp->subpools[subpool_id];
-    
-    int subpool_thread_id = state->ith / GGML_SUBPOOL_COUNT;  // thread 1 -> subpool_thread_id 0, thread 3 -> subpool_thread_id 1 for pool 1
-                                                              // thread 2 -> subpool_thread_id 1, thread 4 -> subpool_thread_id 2 for pool 0
-    
-    // Not the best way to adjuest the the subpool_thread_id
-    if (state->ith == 2 || state->ith == 4) {
-        subpool_thread_id -= 1;
-    }
-        
-    printf("Thread #%d monitoring subpool %d, with subpool_thread_id: %d, subpool ptr: %p\n", state->ith, subpool_id, subpool_thread_id, subpool);
-    
-    while (true) {
-        if (atomic_load(&tp->stop)) {
-            break;
-        }
-        
-        atomic_fetch_add(&subpool->n_threads_ready, 1);
-        
-        if (atomic_load(&subpool->n_threads_ready) == GGML_SUBPOOL_COUNT) {
-            atomic_store(&subpool->state, STATE_READY);
-            printf("subpool %d is ready\n", subpool_id);
-        }
-        
-        // Busy wait for node assignment
-        while (true) {
-            if (atomic_load(&tp->stop)) {
-                break;
-            }
-            
-            ggml_mutex_lock(&subpool->mutex);
-            if (subpool->current_node != NULL) {
-                ggml_mutex_unlock(&subpool->mutex);
-                break; // Exit busy wait if node is assigned
-            }
-            ggml_mutex_unlock(&subpool->mutex);
-        }
-        
-        if (atomic_load(&tp->stop)) {
-            break;
-        }
-        
-        // Update thread state, avoid main thread dispatch
-        atomic_store(&subpool->state, STATE_NOT_READY);
-        atomic_fetch_sub(&subpool->n_threads_ready, 1);
-        
-        struct ggml_compute_params params = {
-            .ith = subpool_thread_id,
-            .nth = GGML_SUBPOOL_COUNT, // Number of threads to use for this node
-            .wsize = tp->cplan->work_size,  // wsize here is maximum intermediate bytes it needed
-            .wdata = malloc(tp->cplan->work_size), // since we are multi-issue, seperate memeory space for those intermediate values
-            .threadpool = tp,             // we use this as flag to determine if current run is issued from subpool or global pool
-            .sub_threadpool = subpool,
-        };
-        
-        ggml_compute_forward(&params, subpool->current_node);
-        
-        ggml_barrier_subpool(subpool);
-        
-//        free(params.wdata);
-        
-        ggml_mutex_lock(&subpool->mutex);
-        subpool->current_node = NULL;
-        ggml_mutex_unlock(&subpool->mutex);
-    }
-
-    return 0;
-}
+//static thread_ret_t ggml_graph_compute_secondary_thread_subpool(void *data) {
+//    struct ggml_compute_state *state = (struct ggml_compute_state *) data;
+//    struct ggml_threadpool *tp = state->threadpool;
+//    int subpool_id = state->ith % GGML_SUBPOOL_COUNT;  // thread 1 -> pool 1; thread 2 -> pool 0; thread 3 -> pool 1; thread 4 -> pool 0
+//    struct ggml_subpool *subpool = &tp->subpools[subpool_id];
+//    
+//    int subpool_thread_id = state->ith / GGML_SUBPOOL_COUNT;  // thread 1 -> subpool_thread_id 0, thread 3 -> subpool_thread_id 1 for pool 1
+//                                                              // thread 2 -> subpool_thread_id 1, thread 4 -> subpool_thread_id 2 for pool 0
+//    
+//    // Not the best way to adjuest the the subpool_thread_id
+//    if (state->ith == 2 || state->ith == 4) {
+//        subpool_thread_id -= 1;
+//    }
+//        
+//    printf("Thread #%d monitoring subpool %d, with subpool_thread_id: %d, subpool ptr: %p\n", state->ith, subpool_id, subpool_thread_id, subpool);
+//    
+//    while (true) {
+//        if (atomic_load(&tp->stop)) {
+//            break;
+//        }
+//        
+//        atomic_fetch_add(&subpool->n_threads_ready, 1);
+//        
+//        if (atomic_load(&subpool->n_threads_ready) == GGML_SUBPOOL_COUNT) {
+//            atomic_store(&subpool->state, STATE_READY);
+//            printf("subpool %d is ready\n", subpool_id);
+//        }
+//        
+//        // Busy wait for node assignment
+//        while (true) {
+//            if (atomic_load(&tp->stop)) {
+//                break;
+//            }
+//            
+//            ggml_mutex_lock(&subpool->mutex);
+//            if (subpool->current_node != NULL) {
+//                ggml_mutex_unlock(&subpool->mutex);
+//                break; // Exit busy wait if node is assigned
+//            }
+//            ggml_mutex_unlock(&subpool->mutex);
+//        }
+//        
+//        if (atomic_load(&tp->stop)) {
+//            break;
+//        }
+//        
+//        // Update thread state, avoid main thread dispatch
+//        atomic_store(&subpool->state, STATE_NOT_READY);
+//        atomic_fetch_sub(&subpool->n_threads_ready, 1);
+//        
+//        struct ggml_compute_params params = {
+//            .ith = subpool_thread_id,
+//            .nth = GGML_SUBPOOL_COUNT, // Number of threads to use for this node
+//            .wsize = tp->cplan->work_size,  // wsize here is maximum intermediate bytes it needed
+//            .wdata = malloc(tp->cplan->work_size), // since we are multi-issue, seperate memeory space for those intermediate values
+//            .threadpool = tp,             // we use this as flag to determine if current run is issued from subpool or global pool
+//            .sub_threadpool = subpool,
+//        };
+//        
+//        ggml_compute_forward(&params, subpool->current_node);
+//        
+//        ggml_barrier_subpool(subpool);
+//        
+////        free(params.wdata);
+//        
+//        ggml_mutex_lock(&subpool->mutex);
+//        subpool->current_node = NULL;
+//        ggml_mutex_unlock(&subpool->mutex);
+//    }
+//
+//    return 0;
+//}
 
 static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
@@ -13964,63 +13994,63 @@ static struct ggml_threadpool * ggml_threadpool_new_impl_worker_t(
     return threadpool;
 }
 
-static struct ggml_threadpool * ggml_threadpool_new_impl_subpool(
-    struct ggml_threadpool_params * tpp,
-    struct ggml_cgraph * cgraph,
-    struct ggml_cplan * cplan) {
-
-    struct ggml_threadpool *threadpool = ggml_aligned_malloc(sizeof(struct ggml_threadpool));
-    threadpool->cgraph = cgraph;
-    threadpool->cplan = cplan;
-    threadpool->stop = false;
-    threadpool->pause = tpp->paused;
-    threadpool->abort = false;
-    threadpool->workers = NULL;
-    threadpool->n_threads_max = tpp->n_threads;
-    threadpool->n_threads_cur = tpp->n_threads;
-    threadpool->poll = tpp->poll;
-    threadpool->prio = tpp->prio;
-    threadpool->ec = GGML_STATUS_SUCCESS;
-
-    // Initialize subpools
-    for (int i = 0; i < GGML_SUBPOOL_COUNT; i++) {
-        ggml_mutex_init(&threadpool->subpools[i].mutex);
-        atomic_store(&threadpool->subpools[i].subpool_id, i);
-        atomic_store(&threadpool->subpools[i].n_threads_ready, 0);
-        atomic_store(&threadpool->subpools[i].barrier_counter, 0);
-        atomic_store(&threadpool->subpools[i].state, STATE_NOT_READY);
-        atomic_store(&threadpool->subpools[i].current_chunk, -1);
-        threadpool->subpools[i].current_node = NULL;
-    }
-
-    // Allocate and init workers state
-    const size_t workers_size = sizeof(struct ggml_compute_state) * tpp->n_threads;
-    struct ggml_compute_state *workers = ggml_aligned_malloc(workers_size);
-    memset(workers, 0, workers_size);
-
-    // if n_threads == 5, then j = 1, 2, 3, 4
-    for (int j = 1; j < tpp->n_threads; j++) {
-        workers[j].threadpool = threadpool;
-        workers[j].ith = j;
-    }
-
-    threadpool->workers = workers;
-    ggml_mutex_init(&threadpool->mutex);
-    ggml_cond_init(&threadpool->cond);
-
-    // Create threads
-    // we are creating n_threads - 1 worker threads in total for subpool
-    // e.g., when we have n_threads = 5, we are spawnning worker threads 1, 2, 3, 4
-    int32_t cpumask_iter = 0;
-    for (int j = 1; j < tpp->n_threads; j++) {
-        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
-        int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread_subpool, &workers[j]);
-//        int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread, &workers[j]);
-        GGML_ASSERT(rc == 0);
-    }
-
-    return threadpool;
-}
+//static struct ggml_threadpool * ggml_threadpool_new_impl_subpool(
+//    struct ggml_threadpool_params * tpp,
+//    struct ggml_cgraph * cgraph,
+//    struct ggml_cplan * cplan) {
+//
+//    struct ggml_threadpool *threadpool = ggml_aligned_malloc(sizeof(struct ggml_threadpool));
+//    threadpool->cgraph = cgraph;
+//    threadpool->cplan = cplan;
+//    threadpool->stop = false;
+//    threadpool->pause = tpp->paused;
+//    threadpool->abort = false;
+//    threadpool->workers = NULL;
+//    threadpool->n_threads_max = tpp->n_threads;
+//    threadpool->n_threads_cur = tpp->n_threads;
+//    threadpool->poll = tpp->poll;
+//    threadpool->prio = tpp->prio;
+//    threadpool->ec = GGML_STATUS_SUCCESS;
+//
+//    // Initialize subpools
+//    for (int i = 0; i < GGML_SUBPOOL_COUNT; i++) {
+//        ggml_mutex_init(&threadpool->subpools[i].mutex);
+//        atomic_store(&threadpool->subpools[i].subpool_id, i);
+//        atomic_store(&threadpool->subpools[i].n_threads_ready, 0);
+//        atomic_store(&threadpool->subpools[i].barrier_counter, 0);
+//        atomic_store(&threadpool->subpools[i].state, STATE_NOT_READY);
+//        atomic_store(&threadpool->subpools[i].current_chunk, -1);
+//        threadpool->subpools[i].current_node = NULL;
+//    }
+//
+//    // Allocate and init workers state
+//    const size_t workers_size = sizeof(struct ggml_compute_state) * tpp->n_threads;
+//    struct ggml_compute_state *workers = ggml_aligned_malloc(workers_size);
+//    memset(workers, 0, workers_size);
+//
+//    // if n_threads == 5, then j = 1, 2, 3, 4
+//    for (int j = 1; j < tpp->n_threads; j++) {
+//        workers[j].threadpool = threadpool;
+//        workers[j].ith = j;
+//    }
+//
+//    threadpool->workers = workers;
+//    ggml_mutex_init(&threadpool->mutex);
+//    ggml_cond_init(&threadpool->cond);
+//
+//    // Create threads
+//    // we are creating n_threads - 1 worker threads in total for subpool
+//    // e.g., when we have n_threads = 5, we are spawnning worker threads 1, 2, 3, 4
+//    int32_t cpumask_iter = 0;
+//    for (int j = 1; j < tpp->n_threads; j++) {
+//        ggml_thread_cpumask_next(tpp->cpumask, workers[j].cpumask, tpp->strict_cpu, &cpumask_iter);
+//        int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread_subpool, &workers[j]);
+////        int32_t rc = ggml_thread_create(&workers[j].thrd, NULL, ggml_graph_compute_secondary_thread, &workers[j]);
+//        GGML_ASSERT(rc == 0);
+//    }
+//
+//    return threadpool;
+//}
 
 static struct ggml_threadpool * ggml_threadpool_new_impl(
     struct ggml_threadpool_params * tpp,
@@ -14093,120 +14123,72 @@ struct ggml_threadpool * ggml_threadpool_new(struct ggml_threadpool_params * tpp
     return ggml_threadpool_new_impl(tpp, NULL, NULL);
 }
 
-// ------- SCEDULER --------
-struct ggml_node_scheduler {
-    struct ggml_ready_queue cpu_queue;
+static void threadpool_free(struct ggml_threadpool * tp) {
+    tp->stop = true;
     
-    struct ggml_ready_queue next_queue;
-    struct ggml_ready_queue current_queue;
-
-    bool is_cpu_available;
-    
-    struct ggml_threadpool * threadpool;
-};
-
-static void init_scheduler(struct ggml_node_scheduler * scheduler, int n_threads, struct ggml_threadpool * tp) {
-    init_queue(&scheduler->next_queue);
-    init_queue(&scheduler->current_queue);
-    init_queue(&scheduler->cpu_queue);
-    scheduler->is_cpu_available = true;
-    scheduler->threadpool = tp;
-}
-
-static void add_child_to_queue(struct ggml_node_scheduler * scheduler, struct ggml_tensor * node) {
-    struct ggml_child_tensor_list *child = node->children;
-    while (child) {
-        child->child->in_degree--;
-        if (child->child->in_degree == 0 && strcmp(child->child->name, "KQ_mask (copy)") != 0) {
-            enqueue(&scheduler->next_queue, child->child);
-        }
-        child = child->next;
+    for (int i = 1; i < tp->n_threads_max; i++) {
+        ggml_thread_join(tp->workers[i].thrd, NULL);
     }
 }
 
-static void dispatch_node(struct ggml_node_scheduler * scheduler, struct ggml_tensor * node) {
-    enqueue(&scheduler->cpu_queue, node);
-}
+// dequeue node and enqueue should only done by main thread
+// main thread enqueue all nodes to threadpool->working_queue
+// worker threads get one (but one dequeue) node from threadpool->working_queue
+// main thread spin-wait queue node to be executed, after then, dequeue the node from threadpool->working_queue
+static void topological_order_execution(struct ggml_ready_queue * queue) {
+    while (!is_queue_empty(queue)) {
+        struct ggml_queue_node * front_node = NULL;
+        struct ggml_tensor * node = NULL;
 
-static void swap_queues(struct ggml_node_scheduler * scheduler) {
-    struct ggml_ready_queue temp = scheduler->current_queue;
-    scheduler->current_queue = scheduler->next_queue;
-    scheduler->next_queue = temp;
-    init_queue(&scheduler->next_queue);
-}
+        // Lock the queue to safely access the front node
+        ggml_mutex_lock(&queue->mutex);
+        if (queue->front) {
+            front_node = queue->front;
+            node = front_node->tensor;
+        }
+        ggml_mutex_unlock(&queue->mutex); // Unlock the queue
 
-static struct ggml_subpool * get_available_subpool(struct ggml_node_scheduler * scheduler) {
-    while(true) {
-        for (int i = 0; i < GGML_SUBPOOL_COUNT; i++) {
-            if (atomic_load(&scheduler->threadpool->subpools[i].state) == STATE_READY) {
-                return &scheduler->threadpool->subpools[i];
+        if (!node) {
+            break; // Queue is empty
+        }
+
+        printf("checking node: %s\n", node->name);
+        // Spin-wait with mutex lock to safely check `tensor->executed`
+        bool is_executed = false;
+        while (!is_executed) {
+            ggml_mutex_lock(&queue->mutex);
+            is_executed = node->executed;
+            ggml_mutex_unlock(&queue->mutex);
+        }
+        
+        // Dequeue the executed node
+        dequeue(queue);
+        
+        // Process the children of the dequeued node
+        struct ggml_child_tensor_list * child = node->children;
+        while (child) {
+            if (strcmp(child->tensor->name, "KQ_mask (copy)") == 0) {
+                child = child->next;
+                continue;
             }
-        }
-    }
-}
-
-static void wait_task_picked_by_subpool(struct ggml_subpool * subpool) {
-    while (atomic_load(&subpool->state) == STATE_READY) {
-        ;
-    }
-}
-
-static void wait_subpool_finish(struct ggml_subpool * subpool) {
-    while (true) {
-        ggml_mutex_lock(&subpool->mutex);
-        if (subpool->current_node == NULL) {
-            // If subpool->current_node change back to NULL,
-            // it must be subpool has finished execution
-            ggml_mutex_unlock(&subpool->mutex);
-            break;
-        }
-        ggml_mutex_unlock(&subpool->mutex);
-    }
-}
-
-static void execute_queue(struct ggml_node_scheduler *scheduler) {
-    struct ggml_threadpool *tp = scheduler->threadpool;
-    
-    // Check if all nodes in the queue are MUL MAT operations
-    if ((scheduler->cpu_queue.all_mul_mat && scheduler->cpu_queue.size == 1) || !scheduler->cpu_queue.all_mul_mat) {
-        // Process nodes serially on the main thread
-        while (!is_queue_empty(&scheduler->cpu_queue)) {
-            struct ggml_tensor *current_node = dequeue(&scheduler->cpu_queue);
-            printf("- Main thread got node [%s]\n", current_node->name);
-            struct ggml_compute_params params = {
-                .ith = 0,  // Main thread is thread 0
-                .nth = 1,
-                .wsize = tp->cplan->work_size,
-                .wdata = tp->cplan->work_data,
-                .threadpool = tp,
-                .sub_threadpool = NULL,
-            };
             
-            ggml_compute_forward(&params, current_node);
+            // Decrement the in-degree of the child atomically
+            int32_t new_in_degree = __atomic_sub_fetch(&child->tensor->in_degree, 1, __ATOMIC_SEQ_CST);
 
-            current_node->executed = true;
+            // If the in-degree becomes 0, enqueue the child node
+            if (new_in_degree == 0) {
+                enqueue(queue, child->tensor);
+                printf("Node [%s] executed, enqueueing child [%s]\n", node->name, child->tensor->name);
+            }
+                        
+            // Move to the next child in the list
+            child = child->next;
         }
-    } else {
-        // Issue nodes concurrently to subpools if all are MUL MAT
-        printf("# Queue count: %d, All MUL MAT, concurrent issue\n", scheduler->cpu_queue.size);
         
-        // tp->working_queue are monitoring by worker threads
-        // it's a shared queue between main thread and worker threads
-        tp->working_queue = &scheduler->cpu_queue;
-        
-        while (!is_queue_empty(tp->working_queue)) {
-            ;
-        }
+//        printf("node [%s] finished\n", node->name);
     }
 }
 
-static void threadpool_free(struct ggml_node_scheduler * scheduler) {
-    scheduler->threadpool->stop = true;
-    
-    for (int i = 1; i < scheduler->threadpool->n_threads_max; i++) {
-        ggml_thread_join(scheduler->threadpool->workers[i].thrd, NULL);
-    }
-}
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph *cgraph, struct ggml_cplan *cplan) {
     ggml_cpu_init();
@@ -14220,50 +14202,24 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph *cgraph, struct ggml_cpla
     struct ggml_threadpool_params ttp = ggml_threadpool_params_default(cplan->n_threads);
     threadpool = ggml_threadpool_new_impl_worker_t(&ttp, cgraph, cplan);
 
-    // Initialize the scheduler with threadpool
-    struct ggml_node_scheduler scheduler;
-    init_scheduler(&scheduler, cplan->n_threads, threadpool);
-
     // Initialize the scheduler's queue with nodes having in_degree == 0 or special case nodes
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        if (cgraph->nodes[i]->in_degree == 0 || strcmp(cgraph->nodes[i]->name, "KQ_mask (copy)") == 0) {
-            enqueue(&scheduler.current_queue, cgraph->nodes[i]);
+        if (strcmp(cgraph->nodes[i]->name, "KQ_mask (copy)") == 0) {
+            cgraph->nodes[i]->in_degree--;
+        }
+        
+        if (cgraph->nodes[i]->in_degree == 0) {
+            enqueue(threadpool->working_queue, cgraph->nodes[i]);
         }
     }
     
-    void * kq_mask_ptr;
-    // Process nodes in topological order using the scheduler
-    while (!is_queue_empty(&scheduler.current_queue) || !is_queue_empty(&scheduler.next_queue)) {
-        // Process nodes in the current queue
-        while (!is_queue_empty(&scheduler.current_queue)) {
-            struct ggml_tensor *current = dequeue(&scheduler.current_queue);
-            
-            // Dispatch to device queue, not yet executed
-            dispatch_node(&scheduler, current);
-
-            if (strcmp(current->name, "KQ_mask (copy)") == 0) {
-                void * new_data = malloc(ggml_nbytes(current));
-                if (new_data == NULL) {
-                    fprintf(stderr, "Memory allocation failed for KQ_mask (copy) tensor.\n");
-                    return;
-                }
-                memcpy(new_data, current->data, ggml_nbytes(current));
-                current->data = new_data;
-                kq_mask_ptr = new_data;
-            }
-            
-            add_child_to_queue(&scheduler, current);
-        }
-        
-        execute_queue(&scheduler);
-        
-        printf("Queue finished execution!\n");
-        swap_queues(&scheduler);
-    }
-        
-    threadpool_free(&scheduler);
+    printf("working_queue size: %d\n", get_size(threadpool->working_queue));  // should be 66
     
-    free(kq_mask_ptr);
+    sleep(1);
+    
+    topological_order_execution(threadpool->working_queue);
+    
+    threadpool_free(threadpool);
     
     return GGML_STATUS_SUCCESS;
 }

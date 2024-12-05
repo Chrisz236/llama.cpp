@@ -6151,7 +6151,7 @@ static void ggml_add_child_tensor(struct ggml_tensor *src, struct ggml_tensor *c
         return;
     }
     
-    new_child->child = current;
+    new_child->tensor = current;
     new_child->next = NULL;
     
     // If the list is empty, make the new child the head
@@ -6236,10 +6236,10 @@ size_t calculate_data_size(struct ggml_tensor *node) {
 }
 
 static void update_child_data(struct ggml_tensor * tensor) {
-    struct ggml_child_tensor_list *child = tensor->children;
+    struct ggml_child_tensor_list * child = tensor->children;
     while (child) {
-        if (child->child->op == GGML_OP_RESHAPE) {
-            child->child->data = tensor->data;
+        if (child->tensor->op == GGML_OP_RESHAPE) {
+            child->tensor->data = tensor->data;
         }
         child = child->next;
     }
@@ -6267,7 +6267,7 @@ static void ggml_update_in_degree_dfs(struct ggml_tensor *node, struct ptr_hash_
     
     for (int i = 0; i < GGML_MAX_SRC; ++i) {
         if (node->src[i]) {
-            if (node->src[i]->op != GGML_OP_NONE){
+            if (node->src[i]->op != GGML_OP_NONE/* && strcmp(node->name, "KQ_mask (copy)") != 0*/){
                 node->in_degree++;
                 ggml_add_child_tensor(node->src[i], node);
                 ggml_update_in_degree_dfs(node->src[i], data_map);
