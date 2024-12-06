@@ -10654,6 +10654,8 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const struct ggml_tensor * mask,
         struct ggml_tensor * dst) {
 
+//    printf("flash attn\n");
+    
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
     GGML_TENSOR_LOCALS(int64_t, nek, k,   ne)
@@ -10806,7 +10808,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                     // s is new maximum, ms < 1.0f, vs == expf(s - s) == 1.0f
                     M = s;
                     ms = expf(Mold - M);
-
+                    
                     // V = V*expf(Mold - M)
                     ggml_vec_scale_f16(D, VKQ16, ms);
                 } else {
@@ -10834,6 +10836,11 @@ static void ggml_compute_forward_flash_attn_ext_f16(
                 // V += v*expf(s - M)
                 ggml_vec_mad_f32(D, VKQ32, V32, vs);
             }
+            
+//            printf("--- iter %lld --- (D: %lld)\n", ic, D);
+//            for (int64_t d = 0; d < D; ++d) {
+//                printf("VKQ16[%lld]: %d\n", d, VKQ16[d]);
+//            }
 
             S = S*ms + vs; // scale and increment sum with partial sum
         }
@@ -10859,6 +10866,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         // permute(0, 2, 1, 3)
         memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
     }
+//    printf("end of flash attn\n");
 }
 
 static void ggml_compute_forward_flash_attn_ext(
@@ -13684,22 +13692,34 @@ bool is_queue_empty(struct ggml_ready_queue * q) {
 }
 
 // Peek one node without dequeueing
-struct ggml_tensor *peek_one(struct ggml_ready_queue *q) {
-    struct ggml_tensor *tensor = NULL;
+struct ggml_tensor * peek_one(struct ggml_ready_queue * q) {
+    struct ggml_tensor *result = NULL;
 
-    ggml_mutex_lock(&q->mutex); // Lock the mutex
+    // Lock the mutex to ensure thread-safe access
+    ggml_mutex_lock(&q->mutex);
 
-    if (q->current) {
-        tensor = q->current->tensor;
-        q->current = q->current->next; // Move to the next node
-    } else {
-        // Reset to front if current is NULL (e.g., queue updated by enqueue)
+    // Check if the queue is empty
+    if (!q->front) {
+        ggml_mutex_unlock(&q->mutex);
+        return NULL;
+    }
+
+    // If current is NULL, start from the front of the queue
+    if (!q->current) {
         q->current = q->front;
     }
 
-    ggml_mutex_unlock(&q->mutex); // Unlock the mutex
+    // Get the tensor from the current node
+    result = q->current->tensor;
 
-    return tensor;
+    // Advance the current pointer to the next node
+    // If we're at the end, wrap around to the front
+    q->current = q->current->next ? q->current->next : q->front;
+
+    // Unlock the mutex
+    ggml_mutex_unlock(&q->mutex);
+
+    return result;
 }
 
 // -------- QUEUE ---------
@@ -13716,6 +13736,16 @@ static thread_ret_t ggml_graph_compute_worker_thread(void *data) {
         return -1;
     }
     
+    struct ggml_compute_params params = {
+        .ith = 0,
+        .nth = 1,
+        .wsize = tp->cplan->work_size,
+        .wdata = local_work_data,
+        .threadpool = tp,
+        .sub_threadpool = NULL,
+    };
+    
+    void * kq_mask_ptr = NULL;
     
     while (true) {
         bool stop_flag = atomic_load(&tp->stop);
@@ -13745,26 +13775,41 @@ static thread_ret_t ggml_graph_compute_worker_thread(void *data) {
         }
         ggml_mutex_unlock(&tp->working_queue->mutex);
         
-        printf("\t- Worker thread %d got node [%s]\n", state->ith, tensor->name);
+//        printf("\t- Worker thread %d got node [%s]\n", state->ith, tensor->name);
         
-        struct ggml_compute_params params = {
-            .ith = 0,
-            .nth = 1,
-            .wsize = tp->cplan->work_size,
-            .wdata = local_work_data,
-            .threadpool = tp,
-            .sub_threadpool = NULL,
-        };
+        if (strcmp(tensor->name, "KQ_mask (copy)") == 0) {
+            void * new_data = malloc(ggml_nbytes(tensor));
+            if (new_data == NULL) {
+                fprintf(stderr, "Memory allocation failed for KQ_mask (copy) tensor.\n");
+                return;
+            }
+            memcpy(new_data, tensor->data, ggml_nbytes(tensor));
+            tensor->data = new_data;
+            kq_mask_ptr = new_data;
+        }
+        
+        struct timespec start_time, end_time;
+        clock_gettime(CLOCK_MONOTONIC, &start_time);
         
         ggml_compute_forward(&params, tensor);
         
+        clock_gettime(CLOCK_MONOTONIC, &end_time);
+        
+        // Calculate elapsed time in milliseconds
+        double elapsed_ms = (end_time.tv_sec - start_time.tv_sec) * 1000.0 +
+        (end_time.tv_nsec - start_time.tv_nsec) / 1000000.0;
+        
+        printf("Topo, OP [%s] takes %.2f ms\n", ggml_op_name(tensor->op), elapsed_ms);
+        
         ggml_mutex_lock(&tp->working_queue->mutex);
         tensor->executed = true;
-        printf("\t- Worker thread %d executed node [%s]\n", state->ith, tensor->name);
         ggml_mutex_unlock(&tp->working_queue->mutex);
+        
+//        printf("\t- Worker thread %d executed node [%s]\n", state->ith, tensor->name);
     }
     
-//    free(local_work_data);
+    //    free(local_work_data);
+    free(kq_mask_ptr);
     return 0;
 }
 
@@ -14152,13 +14197,16 @@ static void topological_order_execution(struct ggml_ready_queue * queue) {
             break; // Queue is empty
         }
 
-        printf("checking node: %s\n", node->name);
-        // Spin-wait with mutex lock to safely check `tensor->executed`
+//        printf("Main thread checking node: %s\n", node->name);
         bool is_executed = false;
         while (!is_executed) {
             ggml_mutex_lock(&queue->mutex);
             is_executed = node->executed;
             ggml_mutex_unlock(&queue->mutex);
+        }
+        
+        if (strcmp(node->name, "node_18") == 0) {
+            printf("node_18!\n");
         }
         
         // Dequeue the executed node
@@ -14178,17 +14226,16 @@ static void topological_order_execution(struct ggml_ready_queue * queue) {
             // If the in-degree becomes 0, enqueue the child node
             if (new_in_degree == 0) {
                 enqueue(queue, child->tensor);
-                printf("Node [%s] executed, enqueueing child [%s]\n", node->name, child->tensor->name);
+//                printf("Node [%s] executed, enqueueing child [%s]\n", node->name, child->tensor->name);
             }
-                        
+            
             // Move to the next child in the list
             child = child->next;
         }
-        
-//        printf("node [%s] finished\n", node->name);
     }
 }
 
+bool is_prefill = true;
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph *cgraph, struct ggml_cplan *cplan) {
     ggml_cpu_init();
@@ -14201,25 +14248,64 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph *cgraph, struct ggml_cpla
     struct ggml_threadpool * threadpool = cplan->threadpool;
     struct ggml_threadpool_params ttp = ggml_threadpool_params_default(cplan->n_threads);
     threadpool = ggml_threadpool_new_impl_worker_t(&ttp, cgraph, cplan);
-
-    // Initialize the scheduler's queue with nodes having in_degree == 0 or special case nodes
+    
+    // ------- FOR LOOP ---------
+    struct ggml_compute_params params = {
+        .ith = 0,
+        .nth = 1,
+        .wsize = threadpool->cplan->work_size,
+        .wdata = threadpool->cplan->work_data,
+        .threadpool = threadpool,
+        .sub_threadpool = NULL,
+    };
+    
+    struct ggml_tensor * last = NULL;
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        if (strcmp(cgraph->nodes[i]->name, "KQ_mask (copy)") == 0) {
-            cgraph->nodes[i]->in_degree--;
+        // Start timing if not prefill stage
+        struct timespec start, end;
+        if (!is_prefill) {
+            clock_gettime(CLOCK_MONOTONIC, &start);
         }
         
-        if (cgraph->nodes[i]->in_degree == 0) {
-            enqueue(threadpool->working_queue, cgraph->nodes[i]);
+        // Execute the forward computation
+        ggml_compute_forward(&params, cgraph->nodes[i]);
+        
+        if (!is_prefill) {
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            double elapsed_ms = (end.tv_sec - start.tv_sec) * 1000.0 + (end.tv_nsec - start.tv_nsec) / 1000000.0;
+            printf("For loop, OP [%s] takes %.2f ms\n", ggml_op_name(cgraph->nodes[i]->op), elapsed_ms);
+        } else {
+            is_prefill = false; // Disable prefill after the first execution
         }
+        
+        cgraph->nodes[i]->executed = true;
+        last = cgraph->nodes[i];
+        
+//        if (strcmp(cgraph->nodes[i]->name, "node_18") == 0) {
+//            printf("node_18!\n");
+//        }
     }
     
-    printf("working_queue size: %d\n", get_size(threadpool->working_queue));  // should be 66
+    // ------- FOR LOOP ---------
     
-    sleep(1);
-    
-    topological_order_execution(threadpool->working_queue);
+//    // Initialize the scheduler's queue with nodes having in_degree == 0 or special case nodes
+//    for (int i = 0; i < cgraph->n_nodes; i++) {
+//        if (strcmp(cgraph->nodes[i]->name, "KQ_mask (copy)") == 0) {
+//            cgraph->nodes[i]->in_degree--;
+//        }
+//        
+//        if (cgraph->nodes[i]->in_degree == 0) {
+//            enqueue(threadpool->working_queue, cgraph->nodes[i]);
+//        }
+//    }
+//    
+//    sleep(1);
+//    
+//    topological_order_execution(threadpool->working_queue);
     
     threadpool_free(threadpool);
+    
+//    printf("last node: %p\n", last);
     
     return GGML_STATUS_SUCCESS;
 }
