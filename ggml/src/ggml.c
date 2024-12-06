@@ -6246,7 +6246,7 @@ static void update_child_data(struct ggml_tensor * tensor) {
 }
 
 // Helper recursive DFS function without external hash set
-static void ggml_update_in_degree_dfs(struct ggml_tensor *node, struct ptr_hash_map *data_map) {
+static void ggml_update_in_degree_dfs(struct ggml_tensor * node, struct ptr_hash_map * data_map) {
     if (node->visited) {
         return;
     }
@@ -6255,8 +6255,10 @@ static void ggml_update_in_degree_dfs(struct ggml_tensor *node, struct ptr_hash_
     
     if (node->op == GGML_OP_MUL_MAT) {
         if (exists_in_map(data_map, node->data)) {
-//            printf("Shared data pointer detected! Node [%s]\n", node->name);
-            free(node->data);
+            if (!node->data) {
+                free(node->data);
+            }
+//            printf("Node [%s] \"%s\" address collision, addr: %p\n", node->name, ggml_op_name(node->op), node->data);
             node->data = malloc(ggml_nbytes(node));
 //            printf("Assigned address: %p\n", node->data);
             update_child_data(node);
