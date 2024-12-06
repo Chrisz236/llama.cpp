@@ -13673,6 +13673,17 @@ void free_queue(struct ggml_ready_queue * queue) {
 
     free(queue);
 }
+
+void enqueue_child_node(struct ggml_tensor * node, struct ggml_ready_queue * queue) {
+    struct ggml_child_tensor_list * child = node->children;
+    while (child) {
+        int32_t new_in_degree = __atomic_sub_fetch(&child->tensor->in_degree, 1, __ATOMIC_SEQ_CST);
+        if (new_in_degree == 0) {
+            enqueue(queue, child->tensor);
+        }
+        child = child->next;
+    }
+}
 // -------- QUEUE ---------
 
 // Thread will be forked upon needed, exit when given node is finished
@@ -14196,47 +14207,80 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph *cgraph, struct ggml_cpla
     };
     
 //    // ------- FOR LOOP ---------
-//    
 //    for (int i = 0; i < cgraph->n_nodes; i++) {
 //        ggml_compute_forward(&params, cgraph->nodes[i]);
 //        cgraph->nodes[i]->executed = true;
 //    }
-//    
 //    // ------- FOR LOOP ---------
+    
+    void * kq_mask_ptr = NULL;
     
     // Enqueue initial in_degree == 0 node and executed it directly in main thread
     for (int i = 0; i < cgraph->n_nodes; i++) {
         if (strcmp(cgraph->nodes[i]->name, "KQ_mask (copy)") == 0) {
+            void * new_data = malloc(ggml_nbytes(cgraph->nodes[i]));
+            if (new_data == NULL) {
+                fprintf(stderr, "Memory allocation failed for KQ_mask (copy) tensor.\n");
+                return;
+            }
+            memcpy(new_data, cgraph->nodes[i]->data, ggml_nbytes(cgraph->nodes[i]));
+            cgraph->nodes[i]->data = new_data;
+            kq_mask_ptr = new_data;
             cgraph->nodes[i]->in_degree--;
         }
         
         if (cgraph->nodes[i]->in_degree == 0) {
-            ggml_compute_forward(&params, cgraph->nodes[i]);
+            enqueue(working_queue, cgraph->nodes[i]);
+        }
+    }
+    
+    // One pass run of initial queue, mostly VIEW operator, fast on main thread
+    const int init_queue_size = working_queue->size;
+    for (int i = 0; i < init_queue_size; i++) {
+        struct ggml_tensor * node = dequeue(working_queue);
+        ggml_compute_forward(&params, node);
+        enqueue_child_node(node, working_queue);
+    }
+    
+    // Topo execution
+    while (!is_queue_empty(working_queue)) {
+        const int queue_size = working_queue->size;
+//        printf("---- queue size: %d\n", queue_size);
+        
+        if (queue_size == 1) {
+            struct ggml_tensor * node = dequeue(working_queue);
+            ggml_compute_forward(&params, node);
+            enqueue_child_node(node, working_queue);
+        } else {
+            // Leave one node to execute in main thread
+            const int num_workers = queue_size - 1;
+            pthread_t workers[num_workers];
+            struct ggml_tensor * worker_nodes[num_workers];
             
-            struct ggml_child_tensor_list * child = cgraph->nodes[i]->children;
-            while (child) {
-                if (strcmp(child->tensor->name, "KQ_mask (copy)") == 0) {
-                    child = child->next;
-                    continue;
-                }
-                
-                int32_t new_in_degree = __atomic_sub_fetch(&child->tensor->in_degree, 1, __ATOMIC_SEQ_CST);
-
-                if (new_in_degree == 0) {
-                    enqueue(working_queue, child->tensor);
-                    printf("Node [%s] executed in main thread, enqueueing child [%s]\n", cgraph->nodes[i]->name, child->tensor->name);
-                }
-                
-                child = child->next;
+            // Node 0, 1, ... queue_size-1 will assign to worker thread
+            for (int i = 0; i < num_workers; i++) {
+                struct ggml_tensor * node = dequeue(working_queue);
+                worker_nodes[i] = node;
+//                printf("\t- [%s] [assigned to worker %d]\n", node->name, i);
+                pthread_create(&workers[i], NULL, ggml_graph_compute_worker_thread, (void *)node);
+            }
+            
+            // Last one node execute in main thread
+            struct ggml_tensor * node = dequeue(working_queue);
+//            printf("\t- [%s] [assigned to main]\n", node->name);
+            ggml_compute_forward(&params, node);
+            enqueue_child_node(node, working_queue);
+            
+            // Main thread wait all worker to finish and enqueue its child
+            for (int i = 0; i < num_workers; i++) {
+                pthread_join(workers[i], NULL);
+                enqueue_child_node(worker_nodes[i], working_queue);
             }
         }
     }
     
-    while (!is_queue_empty(working_queue)) {
-        
-    }
-    
     free(dummy_threadpool);
+    free(kq_mask_ptr);
     
     return GGML_STATUS_SUCCESS;
 }
