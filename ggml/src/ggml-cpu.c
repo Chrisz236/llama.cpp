@@ -1368,7 +1368,6 @@ struct ggml_compute_params {
     void * wdata;
 
     struct ggml_threadpool * threadpool;
-    struct ggml_subpool * sub_threadpool;
 };
 
 //
@@ -13670,20 +13669,30 @@ void enqueue_child_node(struct ggml_tensor * node, struct ggml_ready_queue * que
 }
 // -------- QUEUE ---------
 
+// -------- WORKER ARGS ---------
+struct worker_args {
+    struct ggml_tensor * tensor;
+    int ith;
+    int nth;
+};
+// -------- WORKER ARGS ---------
+
 // Thread will be forked upon needed, exit when given node is finished
 static thread_ret_t ggml_graph_compute_worker_thread(void * data) {
-    struct ggml_tensor * tensor = (struct ggml_tensor *) data;
+    struct worker_args * worker_args = (struct worker_args *) data;
+    struct ggml_tensor * tensor = worker_args->tensor;
+    
+//    printf("\t- worker thread [%s]\n", tensor->name);
     
     struct ggml_threadpool * dummy_threadpool = malloc(sizeof(struct ggml_threadpool));
     atomic_store(&dummy_threadpool->current_chunk, 0);
     
     struct ggml_compute_params params = {
-        .ith = 0,
-        .nth = 1,
+        .ith = worker_args->ith,
+        .nth = worker_args->nth,
         .wsize = ggml_nbytes(tensor),
         .wdata = malloc(ggml_nbytes(tensor)),
         .threadpool = dummy_threadpool,
-        .sub_threadpool = NULL,
     };
     
     ggml_compute_forward(&params, tensor);
@@ -14166,7 +14175,7 @@ static void threadpool_free(struct ggml_threadpool * tp) {
     }
 }
 
-enum ggml_status ggml_graph_compute(struct ggml_cgraph *cgraph, struct ggml_cplan *cplan) {
+enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     ggml_cpu_init();
         
     GGML_ASSERT(cplan);
@@ -14187,12 +14196,31 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph *cgraph, struct ggml_cpla
         .wsize = cplan->work_size,
         .wdata = cplan->work_data,
         .threadpool = dummy_threadpool,  // Reason why we have this is many ops are require threadspools to sync, even we don't need,
-        .sub_threadpool = NULL,
     };
     
 //    // ------- FOR LOOP ---------
 //    for (int i = 0; i < cgraph->n_nodes; i++) {
-//        ggml_compute_forward(&params, cgraph->nodes[i]);
+//        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+//            pthread_t workers[2];
+//
+//            for (int w = 0; w < 2; w++) {
+//                struct worker_args *arg_ptr = malloc(sizeof(struct worker_args));
+//                arg_ptr->tensor = cgraph->nodes[i];
+//                arg_ptr->ith = w;
+//                arg_ptr->nth = 2;
+//
+//                if (pthread_create(&workers[w], NULL, ggml_graph_compute_worker_thread, arg_ptr) != 0) {
+//                    perror("pthread_create failed");
+//                    exit(EXIT_FAILURE);
+//                }
+//            }
+//            
+//            for (int w = 0; w < 2; w++) {
+//                pthread_join(workers[w], NULL);
+//            }
+//        } else {
+//            ggml_compute_forward(&params, cgraph->nodes[i]);
+//        }
 //        cgraph->nodes[i]->executed = true;
 //    }
 //    // ------- FOR LOOP ---------
@@ -14245,8 +14273,14 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph *cgraph, struct ggml_cpla
             for (int i = 0; i < num_workers; i++) {
                 struct ggml_tensor * node = dequeue(working_queue);
                 worker_nodes[i] = node;
+                
+                struct worker_args * warg = malloc(sizeof(struct worker_args));
+                warg->ith = 0;
+                warg->nth = 1;
+                warg->tensor = node;
+                
 //                printf("\t- [%s] [assigned to worker %d]\n", node->name, i);
-                pthread_create(&workers[i], NULL, ggml_graph_compute_worker_thread, (void *)node);
+                pthread_create(&workers[i], NULL, ggml_graph_compute_worker_thread, (void *)warg);
             }
             
             // Last one node execute in main thread
