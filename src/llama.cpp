@@ -10101,6 +10101,8 @@ static struct ggml_tensor * llm_build_rwkv6_time_mix(
     return ggml_reshape_3d(ctx, cur, n_embd, n_seq_tokens, n_seqs);
 }
 
+//int hit_count = 1;
+
 static struct ggml_tensor * llm_build_rwkv6_channel_mix(
         struct llama_context & lctx,
         struct ggml_context * ctx,
@@ -10717,7 +10719,11 @@ struct llm_build_context {
         cur->is_last = true;
         ggml_build_forward_expand(gf, cur);
         
-//        ggml_graph_dump_dot_stdout(gf, NULL, "example.dot");
+//        if (hit_count > 3) {
+//            ggml_graph_dump_dot_stdout(gf, NULL, "example.dot");
+//        }
+//        
+//        hit_count++;
 //        exit(10);
         
         return gf;

@@ -75,10 +75,10 @@ actor LlamaContext {
 //        let n_threads = max(1, min(8, ProcessInfo.processInfo.processorCount - 2))
         
 //        2 P cores (lower utilized) (18 tk/s)
-//        let n_threads = 1
+        let n_threads = 1
         
 //        2 P cores (highly utilized) (26 tk/s)
-        let n_threads = 2
+//        let n_threads = 2
         
 //        2 P cores (highy utilized) + 1 E core (lower utilized) (29 tk/s)
 //        let n_threads = 3
@@ -87,7 +87,7 @@ actor LlamaContext {
 //        let n_threads = 4
         
 //        2 P cores (highly utilized) + 3 E cores (lower utilized) (29 tk/s)
-//        let n_threads = 5
+//        let n_threads = 5  // 1 main thread + 2 * 2 worker thread
         
 //        2 P cores (highly utilized) + 4 E cores (lower utilized) ((23 tk/s)
 //        let n_threads = 6
