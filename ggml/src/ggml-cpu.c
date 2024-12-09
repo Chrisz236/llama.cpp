@@ -7435,22 +7435,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
-static void ggml_barrier_subpool(struct ggml_subpool * subpool) {
-    atomic_fetch_add(&subpool->barrier_counter, 1);
-    
-    if (atomic_load(&subpool->barrier_counter) == GGML_SUBPOOL_COUNT) {
-        // Last finished thread will enter this condition
-        atomic_store(&subpool->barrier_counter, 0);
-        return;
-    }
-    
-    while (atomic_load(&subpool->barrier_counter) > 0) {
-        // Eariler finished threads will trapped here
-        // Exit upon last thread set `barrier_counter` to zero
-        ;
-    }
-}
-
 static void ggml_compute_forward_mul_mat(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
@@ -7669,6 +7653,8 @@ UseGgmlGemm2:;
         
         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
     }
+    
+    printf("end of call for ggml_compute_forward_mul_mat from ith: %d\n", ith);
 }
 
 // ggml_compute_forward_mul_mat_id
@@ -13682,7 +13668,7 @@ static thread_ret_t ggml_graph_compute_worker_thread(void * data) {
     struct worker_args * worker_args = (struct worker_args *) data;
     struct ggml_tensor * tensor = worker_args->tensor;
     
-//    printf("\t- worker thread [%s]\n", tensor->name);
+    printf("\t- worker thread %d/%d [%s]\n", worker_args->ith, worker_args->nth, tensor->name);
     
     struct ggml_threadpool * dummy_threadpool = malloc(sizeof(struct ggml_threadpool));
     atomic_store(&dummy_threadpool->current_chunk, 0);
@@ -14198,107 +14184,108 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         .threadpool = dummy_threadpool,  // Reason why we have this is many ops are require threadspools to sync, even we don't need,
     };
     
-//    // ------- FOR LOOP ---------
+    // TODO: V2 design in working... Now graph level parallel + Tensor level parallel
+    // ------- FOR LOOP ---------
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+            pthread_t workers[2];
+
+            for (int w = 0; w < 2; w++) {
+                struct worker_args *arg_ptr = malloc(sizeof(struct worker_args));
+                arg_ptr->tensor = cgraph->nodes[i];
+                arg_ptr->ith = w;
+                arg_ptr->nth = 2;
+
+                if (pthread_create(&workers[w], NULL, ggml_graph_compute_worker_thread, arg_ptr) != 0) {
+                    perror("pthread_create failed");
+                    exit(EXIT_FAILURE);
+                }
+            }
+            
+            for (int w = 0; w < 2; w++) {
+                pthread_join(workers[w], NULL);
+            }
+        } else {
+            ggml_compute_forward(&params, cgraph->nodes[i]);
+        }
+        cgraph->nodes[i]->executed = true;
+    }
+    // ------- FOR LOOP ---------
+    
+//    void * kq_mask_ptr = NULL;
+//    
+//    // Enqueue initial in_degree == 0 node and executed it directly in main thread
 //    for (int i = 0; i < cgraph->n_nodes; i++) {
-//        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
-//            pthread_t workers[2];
-//
-//            for (int w = 0; w < 2; w++) {
-//                struct worker_args *arg_ptr = malloc(sizeof(struct worker_args));
-//                arg_ptr->tensor = cgraph->nodes[i];
-//                arg_ptr->ith = w;
-//                arg_ptr->nth = 2;
-//
-//                if (pthread_create(&workers[w], NULL, ggml_graph_compute_worker_thread, arg_ptr) != 0) {
-//                    perror("pthread_create failed");
-//                    exit(EXIT_FAILURE);
-//                }
+//        if (strcmp(cgraph->nodes[i]->name, "KQ_mask (copy)") == 0) {
+//            void * new_data = malloc(ggml_nbytes(cgraph->nodes[i]));
+//            if (new_data == NULL) {
+//                fprintf(stderr, "Memory allocation failed for KQ_mask (copy) tensor.\n");
+//                return;
+//            }
+//            memcpy(new_data, cgraph->nodes[i]->data, ggml_nbytes(cgraph->nodes[i]));
+//            cgraph->nodes[i]->data = new_data;
+//            kq_mask_ptr = new_data;
+//            cgraph->nodes[i]->in_degree--;
+//        }
+//        
+//        if (cgraph->nodes[i]->in_degree == 0) {
+//            enqueue(working_queue, cgraph->nodes[i]);
+//        }
+//    }
+//    
+//    // One pass run of initial queue, mostly VIEW operator, fast on main thread
+//    const int init_queue_size = working_queue->size;
+//    for (int i = 0; i < init_queue_size; i++) {
+//        struct ggml_tensor * node = dequeue(working_queue);
+//        ggml_compute_forward(&params, node);
+//        enqueue_child_node(node, working_queue);
+//    }
+//    
+//    // Topo execution
+//    while (!is_queue_empty(working_queue)) {
+//        const int queue_size = working_queue->size;
+////        printf("---- queue size: %d\n", queue_size);
+//        
+//        if (queue_size == 1) {
+//            struct ggml_tensor * node = dequeue(working_queue);
+//            ggml_compute_forward(&params, node);
+//            enqueue_child_node(node, working_queue);
+//        } else {
+//            // Leave one node to execute in main thread
+//            const int num_workers = queue_size - 1;
+//            pthread_t workers[num_workers];
+//            struct ggml_tensor * worker_nodes[num_workers];
+//            
+//            // Node 0, 1, ... queue_size-1 will assign to worker thread
+//            for (int i = 0; i < num_workers; i++) {
+//                struct ggml_tensor * node = dequeue(working_queue);
+//                worker_nodes[i] = node;
+//                
+//                struct worker_args * warg = malloc(sizeof(struct worker_args));
+//                warg->ith = 0;
+//                warg->nth = 1;
+//                warg->tensor = node;
+//                
+////                printf("\t- [%s] [assigned to worker %d]\n", node->name, i);
+//                pthread_create(&workers[i], NULL, ggml_graph_compute_worker_thread, (void *)warg);
 //            }
 //            
-//            for (int w = 0; w < 2; w++) {
-//                pthread_join(workers[w], NULL);
+//            // Last one node execute in main thread
+//            struct ggml_tensor * node = dequeue(working_queue);
+////            printf("\t- [%s] [assigned to main]\n", node->name);
+//            ggml_compute_forward(&params, node);
+//            enqueue_child_node(node, working_queue);
+//            
+//            // Main thread wait all worker to finish and enqueue its child
+//            for (int i = 0; i < num_workers; i++) {
+//                pthread_join(workers[i], NULL);
+//                enqueue_child_node(worker_nodes[i], working_queue);
 //            }
-//        } else {
-//            ggml_compute_forward(&params, cgraph->nodes[i]);
 //        }
-//        cgraph->nodes[i]->executed = true;
 //    }
-//    // ------- FOR LOOP ---------
-    
-    void * kq_mask_ptr = NULL;
-    
-    // Enqueue initial in_degree == 0 node and executed it directly in main thread
-    for (int i = 0; i < cgraph->n_nodes; i++) {
-        if (strcmp(cgraph->nodes[i]->name, "KQ_mask (copy)") == 0) {
-            void * new_data = malloc(ggml_nbytes(cgraph->nodes[i]));
-            if (new_data == NULL) {
-                fprintf(stderr, "Memory allocation failed for KQ_mask (copy) tensor.\n");
-                return;
-            }
-            memcpy(new_data, cgraph->nodes[i]->data, ggml_nbytes(cgraph->nodes[i]));
-            cgraph->nodes[i]->data = new_data;
-            kq_mask_ptr = new_data;
-            cgraph->nodes[i]->in_degree--;
-        }
-        
-        if (cgraph->nodes[i]->in_degree == 0) {
-            enqueue(working_queue, cgraph->nodes[i]);
-        }
-    }
-    
-    // One pass run of initial queue, mostly VIEW operator, fast on main thread
-    const int init_queue_size = working_queue->size;
-    for (int i = 0; i < init_queue_size; i++) {
-        struct ggml_tensor * node = dequeue(working_queue);
-        ggml_compute_forward(&params, node);
-        enqueue_child_node(node, working_queue);
-    }
-    
-    // Topo execution
-    while (!is_queue_empty(working_queue)) {
-        const int queue_size = working_queue->size;
-//        printf("---- queue size: %d\n", queue_size);
-        
-        if (queue_size == 1) {
-            struct ggml_tensor * node = dequeue(working_queue);
-            ggml_compute_forward(&params, node);
-            enqueue_child_node(node, working_queue);
-        } else {
-            // Leave one node to execute in main thread
-            const int num_workers = queue_size - 1;
-            pthread_t workers[num_workers];
-            struct ggml_tensor * worker_nodes[num_workers];
-            
-            // Node 0, 1, ... queue_size-1 will assign to worker thread
-            for (int i = 0; i < num_workers; i++) {
-                struct ggml_tensor * node = dequeue(working_queue);
-                worker_nodes[i] = node;
-                
-                struct worker_args * warg = malloc(sizeof(struct worker_args));
-                warg->ith = 0;
-                warg->nth = 1;
-                warg->tensor = node;
-                
-//                printf("\t- [%s] [assigned to worker %d]\n", node->name, i);
-                pthread_create(&workers[i], NULL, ggml_graph_compute_worker_thread, (void *)warg);
-            }
-            
-            // Last one node execute in main thread
-            struct ggml_tensor * node = dequeue(working_queue);
-//            printf("\t- [%s] [assigned to main]\n", node->name);
-            ggml_compute_forward(&params, node);
-            enqueue_child_node(node, working_queue);
-            
-            // Main thread wait all worker to finish and enqueue its child
-            for (int i = 0; i < num_workers; i++) {
-                pthread_join(workers[i], NULL);
-                enqueue_child_node(worker_nodes[i], working_queue);
-            }
-        }
-    }
-    
-    free(dummy_threadpool);
-    free(kq_mask_ptr);
+//    
+//    free(dummy_threadpool);
+//    free(kq_mask_ptr);
     
     return GGML_STATUS_SUCCESS;
 }
