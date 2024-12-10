@@ -6252,6 +6252,7 @@ static void ggml_update_in_degree_dfs(struct ggml_tensor * node, struct ptr_hash
     }
     
     node->visited = true;
+//    node->child_has_been_enqueued = false;
     
     if (node->op == GGML_OP_MUL_MAT) {
         if (exists_in_map(data_map, node->data)) {

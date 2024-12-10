@@ -632,6 +632,9 @@ extern "C" {
         // 1 bytes
         bool is_last;
         
+        // 1 bytes
+//        bool child_has_been_enqueued;
+        
         // 16 bytes (2 pointers inside)
         struct ggml_child_tensor_list * children;
         
