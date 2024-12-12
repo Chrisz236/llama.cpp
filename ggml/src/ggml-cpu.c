@@ -1542,6 +1542,7 @@ static void ggml_vec_dot_f16(int n, float * restrict s, size_t bs, ggml_fp16_t *
 #endif
 
     *s = sumf;
+//    printf("sumf: %f\n", sumf);
 }
 
 // compute GGML_VEC_DOT_UNROLL dot products at once
@@ -2287,6 +2288,19 @@ void ggml_critical_section_start(void) {
 
 void ggml_critical_section_end(void) {
     atomic_flag_clear(&g_state_critical);
+}
+
+static void two_threads_barrier(struct ggml_threadpool * tp) {
+    atomic_fetch_add(&tp->n_barrier_passed, 1);
+    
+    if (atomic_load(&tp->n_barrier_passed) == 2) {
+        // last thread
+        return;
+    }
+    
+    while (atomic_load(&tp->n_barrier_passed) < 2) {
+        ;
+    }
 }
 
 static void ggml_barrier(struct ggml_threadpool * tp) {
@@ -7352,7 +7366,9 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const int64_t ir0_end,
     const int64_t ir1_start,
     const int64_t ir1_end) {
-
+    
+//    printf("ggml_compute_forward_mul_mat_one_chunk: ir0_start[%lld], ir0_end[%lld], ir1_start[%lld], ir1_end[%lld]\n", ir0_start, ir0_end, ir1_start, ir1_end);
+    
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -7376,7 +7392,8 @@ static void ggml_compute_forward_mul_mat_one_chunk(
         return;
     }
 
-    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
+    const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;  // wdata = params->wdata
+//    printf("wdata: %p\n", wdata);
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
     assert(ne12 % ne02 == 0);
@@ -7419,12 +7436,21 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                         : (i11 * nb11 + i12 * nb12 + i13 * nb13));
                 float * dst_col = (float*)((char*)dst->data + (i1 * nb1 + i2 * nb2 + i3 * nb3));
 
-                //for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
-                //    vec_dot(ne00, &dst_col[ir0], src0_row + ir0*nb01, src1_col);
-                //}
+//                for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ++ir0) {
+//                    vec_dot(ne00, &dst_col[ir0], 0, src0_row + ir0*nb01, 0, src1_col, 0, 0);
+//                }
 
                 for (int64_t ir0 = iir0; ir0 < iir0 + blck_0 && ir0 < ir0_end; ir0 += num_rows_per_vec_dot) {
                     vec_dot(ne00, &tmp[ir0 - iir0], (num_rows_per_vec_dot > 1 ? 16 : 0), src0_row + ir0 * nb01, (num_rows_per_vec_dot > 1 ? nb01 : 0), src1_col, (num_rows_per_vec_dot > 1 ? src1_col_stride : 0), num_rows_per_vec_dot);
+                    // ggml_vec_dot_f16(n, s, bs, x, bx, y, by, nrc)
+                    // n = ne00
+                    // s = &tmp[ir0 - iir0]
+                    // bs = (num_rows_per_vec_dot > 1 ? 16 : 0) (NOT USED)
+                    // x = src0_row + ir0 * nb01
+                    // bx = (num_rows_per_vec_dot > 1 ? nb01 : 0) (NOT USED)
+                    // y = src1_col
+                    // by = (num_rows_per_vec_dot > 1 ? src1_col_stride : 0) (NOT USED)
+                    // nrc = num_rows_per_vec_dot
                 }
 
                 for (int cn = 0; cn < num_rows_per_vec_dot; ++cn) {
@@ -7435,163 +7461,13 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 }
 
-static void ggml_compute_forward_mul_mat_no_threadpool(
-        const struct ggml_compute_params * params,
-              struct ggml_tensor * dst) {
-    
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
+void print_wdata_as_int16(const void *wdata, int n) {
+    // Cast the wdata pointer to int16_t pointer
+    const int16_t *data = (const int16_t *)wdata;
 
-    GGML_TENSOR_BINARY_OP_LOCALS
-
-    const int ith = params->ith;  // 0, 1
-    const int nth = params->nth;  // 2
-
-    const enum ggml_type type = src0->type;
-
-    enum ggml_type           const vec_dot_type         = type_traits_cpu[type].vec_dot_type;
-    ggml_from_float_t        const from_float           = ggml_get_type_traits(vec_dot_type)->from_float;
-    ggml_from_float_to_mat_t const from_float_to_mat    = type_traits_cpu[vec_dot_type].from_float_to_mat;
-    int64_t                  const vec_dot_num_rows     = type_traits_cpu[type].nrows;
-    int64_t                  const matmul_num_cols      = type_traits_cpu[type].ncols;
-    int64_t                  const blck_size_interleave = ggml_get_type_traits(type)->blck_size_interleave;
-    ggml_gemv_t              const gemv                 = type_traits_cpu[type].gemv;
-    ggml_gemm_t              const gemm                 = type_traits_cpu[type].gemm;
-
-    GGML_ASSERT(ne0 == ne01);
-    GGML_ASSERT(ne1 == ne11);
-    GGML_ASSERT(ne2 == ne12);
-    GGML_ASSERT(ne3 == ne13);
-
-    // we don't support permuted src0 or src1
-    GGML_ASSERT(nb00 == ggml_type_size(type));
-    GGML_ASSERT(nb10 == ggml_type_size(src1->type));
-
-    // dst cannot be transposed or permuted
-    GGML_ASSERT(nb0 == sizeof(float));
-    GGML_ASSERT(nb0 <= nb1);
-    GGML_ASSERT(nb1 <= nb2);
-    GGML_ASSERT(nb2 <= nb3);
-
-    // nb01 >= nb00 - src0 is not transposed
-    //   compute by src0 rows
-    
-    // Quantization, F32->F16
-    if (src1->type != vec_dot_type) {
-        char * wdata = params->wdata;
-
-        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
-        const size_t nbw2 = nbw1*ne11;
-        const size_t nbw3 = nbw2*ne12;
-
-        assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
-
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                int64_t i11_processed = 0;
-                if ((ggml_n_dims(src1) == 2) && from_float_to_mat && gemm) {
-                    for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
-                        from_float_to_mat((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                                          (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                                          4, ne10, blck_size_interleave);
-                    }
-                    i11_processed = ne11 - ne11 % 4;
-                }
-                for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                           (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                           ne10);
-                }
-            }
-        }
-    }
-        
-    // Only thread 0 is setting up the current_chunk to nth
-        
-    // This is the size of the first dimension of the result, so we can iterate that way. (see the ASSERT above, these are the same numbers)
-    const int64_t nr0 = ne0;
-
-    // This is the size of the rest of the dimensions of the result
-    const int64_t nr1 = ne1 * ne2 * ne3;
-
-    // dot kernels can handle 1 row and col at a time, but mmla kernels can process 2 rows and cols
-    int64_t num_rows_per_vec_dot = vec_dot_num_rows;
-    // TODO: currently the mmla kernels support only even numbered rows/cols.
-    // this check can be removed once they are extended to support odd numbered rows/cols too
-    if ((nr0 % 2 != 0) || (ne11 % 2 != 0)) {
-        num_rows_per_vec_dot = 1;
-    }
-
-    // Now select a reasonable chunk size.
-    int chunk_size = 16;
-
-    // We need to step up the size if it's small
-    if (nr0 == 1 || nr1 == 1) {
-        chunk_size = 64;
-    }
-
-    // distribute the work across the inner or outer loop based on which one is larger
-    // The number of chunks in the 0/1 dim.
-    // CEIL(nr0/chunk_size)
-    int64_t nchunk0 = (nr0 + chunk_size - 1) / chunk_size;
-    int64_t nchunk1 = (nr1 + chunk_size - 1) / chunk_size;
-
-    // If the chunking is poor for the number of threads on this setup, scrap the whole plan.  Re-chunk it by thread.
-    //   Also, chunking by thread was measured to have perform better on NUMA systems.  See https://github.com/ggerganov/llama.cpp/pull/6915
-    //   In theory, chunking should be just as useful on NUMA and non NUMA systems, but testing disagreed with that.
-    if (nchunk0 * nchunk1 < nth * 4 || ggml_is_numa()) {
-        // distribute the thread work across the inner or outer loop based on which one is larger
-        nchunk0 = nr0 > nr1 ? nth : 1; // parallelize by src0 rows
-        nchunk1 = nr0 > nr1 ? 1 : nth; // parallelize by src1 rows
-    }
-
-    // The number of elements in each chunk
-    const int64_t dr0 = (nr0 + nchunk0 - 1) / nchunk0;
-    const int64_t dr1 = (nr1 + nchunk1 - 1) / nchunk1;
-
-    if ((ggml_n_dims(src0) == 2) && gemv) {
-        const void * src1_wdata      = (src1->type == vec_dot_type) ? src1->data : params->wdata;
-        const size_t src1_col_stride = ggml_is_contiguous(src1) || src1->type != vec_dot_type ? ggml_row_size(vec_dot_type, ne10) : nb11;
-        int64_t src0_start = (ith * ne01) / nth;
-        int64_t src0_end   = ((ith + 1) * ne01) / nth;
-        src0_start = (src0_start % matmul_num_cols) ? src0_start + matmul_num_cols - (src0_start % matmul_num_cols): src0_start;
-        src0_end   = (src0_end   % matmul_num_cols) ? src0_end   + matmul_num_cols - (src0_end   % matmul_num_cols): src0_end;
-        if (src0_start >= src0_end) return;
-
-        // If there are more than three rows in src1, use gemm; otherwise, use gemv.
-        if (gemm && (ne11 > 3)) {
-            gemm(ne00, (float *)((char *) dst->data) + src0_start, ne01, (const char *) src0->data + src0_start * nb01,
-                 (const char *) src1_wdata, ne11 - ne11 % 4, src0_end - src0_start);
-        }
-        for (int iter = gemm ? ne11 - ne11 % 4 : 0; iter < ne11; iter++) {
-            gemv(ne00, (float *)((char *) dst->data + (iter * nb1)) + src0_start, ne01,
-                 (const char *) src0->data + src0_start * nb01, (const char *) src1_wdata + (src1_col_stride * iter), 1,
-                 src0_end - src0_start);
-        }
-        return;
-    }
-
-    // The first chunk comes from our thread_id, the rest will get auto-assigned.
-    int current_chunk = ith;
-
-    while (current_chunk < nchunk0 * nchunk1) {
-        const int64_t ith0 = current_chunk % nchunk0;
-        const int64_t ith1 = current_chunk / nchunk0;
-
-        const int64_t ir0_start = dr0 * ith0;
-        const int64_t ir0_end = MIN(ir0_start + dr0, nr0);
-
-        const int64_t ir1_start = dr1 * ith1;
-        const int64_t ir1_end = MIN(ir1_start + dr1, nr1);
-
-        ggml_compute_forward_mul_mat_one_chunk(params, dst, num_rows_per_vec_dot, ir0_start, ir0_end, ir1_start, ir1_end);
-
-        if (nth >= nchunk0 * nchunk1) {
-            break;
-        }
-        
-        current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
+    // Print all elements in the array
+    for (int i = 0; i < n; i++) {
+        printf("Element %d: %d\n", i, data[i]);
     }
 }
 
@@ -7610,7 +7486,7 @@ static void ggml_compute_forward_mul_mat(
     const enum ggml_type type = src0->type;
 
     enum ggml_type           const vec_dot_type         = type_traits_cpu[type].vec_dot_type;
-    ggml_from_float_t        const from_float           = ggml_get_type_traits(vec_dot_type)->from_float;
+    ggml_from_float_t        const from_float           = ggml_get_type_traits(vec_dot_type)->from_float;   // FP32 TO FP16 array (void ggml_fp32_to_fp16_row(const float * x, ggml_fp16_t * y, int64_t n))
     ggml_from_float_to_mat_t const from_float_to_mat    = type_traits_cpu[vec_dot_type].from_float_to_mat;
     int64_t                  const vec_dot_num_rows     = type_traits_cpu[type].nrows;
     int64_t                  const matmul_num_cols      = type_traits_cpu[type].ncols;
@@ -7664,6 +7540,8 @@ UseGgmlGemm1:;
 #endif
     
     // Quantization, F32->F16
+    // src1->type == GGML_TYPE_F32
+    // vec_dot_type == GGML_TYPE_F16
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
 
@@ -7685,26 +7563,29 @@ UseGgmlGemm1:;
                     }
                     i11_processed = ne11 - ne11 % 4;
                 }
+                // Each worker thread will be responsible to portion of data convertion from src1->data to wdata
                 for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
                     from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
                            (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
                            ne10);
+                    // ggml_fp32_to_fp16_row(const float * x, ggml_fp16_t * y, int64_t n)
+                    // x = (float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11)
+                    // y = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1
+                    // n = ne10
                 }
             }
         }
     }
-        
+
     // Only thread 0 is setting up the current_chunk to nth
-    // potentially a bug for us, as we are not using main thread (thread 0) for computation
-    // need check if our threads are 0-indexed or 1-indexed.
-    
-    // This case only trigger when main thread (single thread) is calling mul mat
-    if (ith == 0) {
-        // Every thread starts at ith, so the first unprocessed chunk is nth.  This save a bit of coordination right at the start.
-        atomic_store_explicit(&params->threadpool->current_chunk, nth, memory_order_relaxed);
+    if (nth == 1) {
+        atomic_store_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
     }
     
-
+    if (nth == 2) {
+        two_threads_barrier(params->threadpool);
+    }
+    
 #if GGML_USE_LLAMAFILE
     if (src1->type != vec_dot_type) {
         const void* wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;
@@ -7811,6 +7692,7 @@ UseGgmlGemm2:;
             break;
         }
         
+        printf("thread %d executed chunk %d [%lldx%lld]\n", ith, current_chunk, ir0_end - ir0_start, ir1_end - ir1_start);
         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
     }
 }
@@ -12609,13 +12491,9 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_group_norm(params, tensor);
             } break;
-        case GGML_OP_MUL_MAT:
+        case GGML_OP_MUL_MAT:  // ---- MULMAT ----
             {
-                if (params->nth == 2) {
-                    ggml_compute_forward_mul_mat_no_threadpool(params, tensor);
-                } else {
-                    ggml_compute_forward_mul_mat(params, tensor);
-                }
+                ggml_compute_forward_mul_mat(params, tensor);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
@@ -12873,68 +12751,69 @@ struct worker_args {
     struct ggml_tensor * tensor;
     int ith;
     int nth;
+    struct ggml_threadpool * tp;
+    void * wdata;
 };
 // -------- WORKER ARGS ---------
 
-// -------- WRAPPER API FOR GGML_COMPUTE_FORWARD --------
+// -------- CHRIS WRAPPER API FOR GGML_COMPUTE_FORWARD --------
 
 // Another half will be executed via this worker
 static thread_ret_t ggml_mulmat_worker(void * data) {
     struct worker_args * worker_args = (struct worker_args *) data;
     struct ggml_tensor * tensor = worker_args->tensor;
+    struct ggml_threadpool * tp = worker_args->tp;
     
     printf("\t- worker thread %d/%d [%s]\n", worker_args->ith, worker_args->nth, tensor->name);
-    
-    struct ggml_threadpool * dummy_threadpool = malloc(sizeof(struct ggml_threadpool));
-    atomic_store(&dummy_threadpool->current_chunk, 0);
-    
     struct ggml_compute_params params = {
         .ith = worker_args->ith,
         .nth = worker_args->nth,
         .wsize = ggml_nbytes(tensor),
-        .wdata = malloc(ggml_nbytes(tensor)),
-        .threadpool = dummy_threadpool,
+        .wdata = worker_args->wdata,
+        .threadpool = tp,
     };
-    
     ggml_compute_forward(&params, tensor);
-    
-    free(dummy_threadpool);
-    free(params.wdata);
     
     return NULL;
 }
 
 // Whoever calls this function will execute half of the tensor
 static void mulmat_with_two_threads(struct ggml_tensor * tensor) {
+    struct ggml_threadpool * dummy_threadpool = malloc(sizeof(struct ggml_threadpool));
+    atomic_store(&dummy_threadpool->current_chunk, 2);
+    atomic_store(&dummy_threadpool->n_barrier_passed, 0);
+    
+    void * wdata = malloc(ggml_nbytes(tensor));
+    
+    // ----- MULMAT WORKER PART -----
     pthread_t worker;
     struct worker_args * warg = malloc(sizeof(struct worker_args));
     warg->ith = 0;
     warg->nth = 2;
     warg->tensor = tensor;
+    warg->tp = dummy_threadpool;
+    warg->wdata = wdata;
     pthread_create(&worker, NULL, ggml_mulmat_worker, (void *)warg);
     
-    struct ggml_threadpool * dummy_threadpool = malloc(sizeof(struct ggml_threadpool));
-    atomic_store(&dummy_threadpool->current_chunk, 0);
-    
+    // FIXME: Bug here, when using main thread execute the tensor, its part is 0.0
+    // ----- MULMAT MAIN PART -----
     struct ggml_compute_params params_main = {
         .ith = 1,
         .nth = 2,
         .wsize = ggml_nbytes(tensor),
-        .wdata = malloc(ggml_nbytes(tensor)),
-        .threadpool = dummy_threadpool,  // Reason why we have this is many ops are require threadspools to sync, even we don't need,
+        .wdata = wdata,
+        .threadpool = dummy_threadpool,
     };
-
     printf("\t- main   thread 1/%d [%s]\n", 2, tensor->name);
-    
     ggml_compute_forward(&params_main, tensor);
     
     pthread_join(worker, NULL);
     
     free(dummy_threadpool);
-    free(params_main.wdata);
+    free(wdata);
 }
 
-// -------- WRAPPER API FOR GGML_COMPUTE_FORWARD --------
+// -------- CHRIS WRAPPER API FOR GGML_COMPUTE_FORWARD --------
 
 // Android's libc implementation "bionic" does not support setting affinity
 #if defined(__gnu_linux__)
@@ -13886,6 +13765,7 @@ void enqueue_child_node(struct ggml_tensor * node, struct ggml_ready_queue * que
 // -------- QUEUE ---------
 
 // Thread will be forked upon needed, exit when given node is finished
+// This path is used for single worker thread approach
 static thread_ret_t ggml_graph_compute_worker_thread(void * data) {
     struct worker_args * worker_args = (struct worker_args *) data;
     struct ggml_tensor * tensor = worker_args->tensor;
@@ -13997,79 +13877,6 @@ static thread_ret_t ggml_graph_compute_worker_thread(void * data) {
 //    
 //    //    free(local_work_data);
 //    free(kq_mask_ptr);
-//    return 0;
-//}
-
-//static thread_ret_t ggml_graph_compute_secondary_thread_subpool(void *data) {
-//    struct ggml_compute_state *state = (struct ggml_compute_state *) data;
-//    struct ggml_threadpool *tp = state->threadpool;
-//    int subpool_id = state->ith % GGML_SUBPOOL_COUNT;  // thread 1 -> pool 1; thread 2 -> pool 0; thread 3 -> pool 1; thread 4 -> pool 0
-//    struct ggml_subpool *subpool = &tp->subpools[subpool_id];
-//    
-//    int subpool_thread_id = state->ith / GGML_SUBPOOL_COUNT;  // thread 1 -> subpool_thread_id 0, thread 3 -> subpool_thread_id 1 for pool 1
-//                                                              // thread 2 -> subpool_thread_id 1, thread 4 -> subpool_thread_id 2 for pool 0
-//    
-//    // Not the best way to adjuest the the subpool_thread_id
-//    if (state->ith == 2 || state->ith == 4) {
-//        subpool_thread_id -= 1;
-//    }
-//        
-//    printf("Thread #%d monitoring subpool %d, with subpool_thread_id: %d, subpool ptr: %p\n", state->ith, subpool_id, subpool_thread_id, subpool);
-//    
-//    while (true) {
-//        if (atomic_load(&tp->stop)) {
-//            break;
-//        }
-//        
-//        atomic_fetch_add(&subpool->n_threads_ready, 1);
-//        
-//        if (atomic_load(&subpool->n_threads_ready) == GGML_SUBPOOL_COUNT) {
-//            atomic_store(&subpool->state, STATE_READY);
-//            printf("subpool %d is ready\n", subpool_id);
-//        }
-//        
-//        // Busy wait for node assignment
-//        while (true) {
-//            if (atomic_load(&tp->stop)) {
-//                break;
-//            }
-//            
-//            ggml_mutex_lock(&subpool->mutex);
-//            if (subpool->current_node != NULL) {
-//                ggml_mutex_unlock(&subpool->mutex);
-//                break; // Exit busy wait if node is assigned
-//            }
-//            ggml_mutex_unlock(&subpool->mutex);
-//        }
-//        
-//        if (atomic_load(&tp->stop)) {
-//            break;
-//        }
-//        
-//        // Update thread state, avoid main thread dispatch
-//        atomic_store(&subpool->state, STATE_NOT_READY);
-//        atomic_fetch_sub(&subpool->n_threads_ready, 1);
-//        
-//        struct ggml_compute_params params = {
-//            .ith = subpool_thread_id,
-//            .nth = GGML_SUBPOOL_COUNT, // Number of threads to use for this node
-//            .wsize = tp->cplan->work_size,  // wsize here is maximum intermediate bytes it needed
-//            .wdata = malloc(tp->cplan->work_size), // since we are multi-issue, seperate memeory space for those intermediate values
-//            .threadpool = tp,             // we use this as flag to determine if current run is issued from subpool or global pool
-//            .sub_threadpool = subpool,
-//        };
-//        
-//        ggml_compute_forward(&params, subpool->current_node);
-//        
-//        ggml_barrier_subpool(subpool);
-//        
-////        free(params.wdata);
-//        
-//        ggml_mutex_lock(&subpool->mutex);
-//        subpool->current_node = NULL;
-//        ggml_mutex_unlock(&subpool->mutex);
-//    }
-//
 //    return 0;
 //}
 
@@ -14383,15 +14190,21 @@ static void threadpool_free(struct ggml_threadpool * tp) {
     }
 }
 
+static void print_data(const float * a, long size) {
+    printf("data: [");
+    for (long i = 0; i < size; i++) {
+        printf("(%ld)%f, ",i , a[i]);
+    }
+    printf("]\n");
+}
+
 static bool is_data_equal(const float * a, const float * b, long size) {
     for (long i = 0; i < size; i++) {
-        printf("a[%ld] = %f and b[%ld] = %f\n", i, a[i], i, b[i]);
         if (a[i] != b[i]) {
             printf("a[%ld] != b[%ld], where a[%ld] = %f and b[%ld] = %f\n", i, i, i, a[i], i, b[i]);
             return false;
         }
     }
-    
     return true;
 }
 
@@ -14423,25 +14236,28 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         printf("---- Node [%s] (%p)\n", cgraph->nodes[i]->name, cgraph->nodes[i]);
         
         if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
-            float * a = malloc(ggml_nelements(cgraph->nodes[i]) * sizeof(float));
-            float * b = malloc(ggml_nelements(cgraph->nodes[i]) * sizeof(float));
-            
-            ggml_compute_forward(&params, cgraph->nodes[i]);
-            memcpy(a, cgraph->nodes[i]->data, ggml_nelements(cgraph->nodes[i]));
-            
-            memset(cgraph->nodes[i]->data, 0, ggml_nelements(cgraph->nodes[i]));
+//            float * a = malloc(ggml_nelements(cgraph->nodes[i]) * sizeof(float));
+//            float * b = malloc(ggml_nelements(cgraph->nodes[i]) * sizeof(float));
+//            
+//            ggml_compute_forward(&params, cgraph->nodes[i]);
+//            memcpy(a, cgraph->nodes[i]->data, ggml_nelements(cgraph->nodes[i]));
+//            
+//            printf("-------------------------------------------\n");
+//            memset(cgraph->nodes[i]->data, 0, ggml_nelements(cgraph->nodes[i]));
             
             mulmat_with_two_threads(cgraph->nodes[i]);
-            memcpy(b, cgraph->nodes[i]->data, ggml_nelements(cgraph->nodes[i]));
+//            memcpy(b, cgraph->nodes[i]->data, ggml_nelements(cgraph->nodes[i]));
             
-            if (!is_data_equal(a, b, ggml_nelements(cgraph->nodes[i]))) {
-                printf("Tensor [%s] result inconsistent\n", cgraph->nodes[i]->name);
-            }
+//            print_data(a, ggml_nelements(cgraph->nodes[i]));
+//            print_data(b, ggml_nelements(cgraph->nodes[i]));
+//            if (!is_data_equal(a, b, ggml_nelements(cgraph->nodes[i]))) {
+//                printf("Tensor [%s] result inconsistent\n", cgraph->nodes[i]->name);
+//            }
             
             printf("[%s] (%p) finished!\n", cgraph->nodes[i]->name, cgraph->nodes[i]);
-            
-            free(a);
-            free(b);
+//            
+//            free(a);
+//            free(b);
         } else {
             ggml_compute_forward(&params, cgraph->nodes[i]);
         }
