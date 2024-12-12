@@ -7366,9 +7366,7 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     const int64_t ir0_end,
     const int64_t ir1_start,
     const int64_t ir1_end) {
-    
-//    printf("ggml_compute_forward_mul_mat_one_chunk: ir0_start[%lld], ir0_end[%lld], ir1_start[%lld], ir1_end[%lld]\n", ir0_start, ir0_end, ir1_start, ir1_end);
-    
+        
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
 
@@ -7393,7 +7391,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
     }
 
     const void * wdata = (src1->type == vec_dot_type) ? src1->data : params->wdata;  // wdata = params->wdata
-//    printf("wdata: %p\n", wdata);
     const size_t row_size = ggml_row_size(vec_dot_type, ne10);
 
     assert(ne12 % ne02 == 0);
@@ -7458,16 +7455,6 @@ static void ggml_compute_forward_mul_mat_one_chunk(
                 }
             }
         }
-    }
-}
-
-void print_wdata_as_int16(const void *wdata, int n) {
-    // Cast the wdata pointer to int16_t pointer
-    const int16_t *data = (const int16_t *)wdata;
-
-    // Print all elements in the array
-    for (int i = 0; i < n; i++) {
-        printf("Element %d: %d\n", i, data[i]);
     }
 }
 
@@ -7544,44 +7531,30 @@ UseGgmlGemm1:;
     // vec_dot_type == GGML_TYPE_F16
     if (src1->type != vec_dot_type) {
         char * wdata = params->wdata;
-
+        
         const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
         const size_t nbw2 = nbw1*ne11;
         const size_t nbw3 = nbw2*ne12;
-
+        
         assert(params->wsize >= ne13*nbw3);
         GGML_ASSERT(src1->type == GGML_TYPE_F32);
-
+        
         for (int64_t i13 = 0; i13 < ne13; ++i13) {
             for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                int64_t i11_processed = 0;
-                if ((ggml_n_dims(src1) == 2) && from_float_to_mat && gemm) {
-                    for (int64_t i11 = ith * 4; i11 < ne11 - ne11 % 4; i11 += nth * 4) {
-                        from_float_to_mat((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                                          (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                                          4, ne10, blck_size_interleave);
-                    }
-                    i11_processed = ne11 - ne11 % 4;
-                }
-                // Each worker thread will be responsible to portion of data convertion from src1->data to wdata
-                for (int64_t i11 = i11_processed + ith; i11 < ne11; i11 += nth) {
+                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
                     from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                           (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                           ne10);
-                    // ggml_fp32_to_fp16_row(const float * x, ggml_fp16_t * y, int64_t n)
-                    // x = (float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11)
-                    // y = wdata + i13*nbw3 + i12*nbw2 + i11*nbw1
-                    // n = ne10
+                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
+                               ne10);
                 }
             }
         }
     }
-
+        
     // Only thread 0 is setting up the current_chunk to nth
     if (nth == 1) {
         atomic_store_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
     }
-    
+        
     if (nth == 2) {
         two_threads_barrier(params->threadpool);
     }
@@ -7692,7 +7665,7 @@ UseGgmlGemm2:;
             break;
         }
         
-        printf("thread %d executed chunk %d [%lldx%lld]\n", ith, current_chunk, ir0_end - ir0_start, ir1_end - ir1_start);
+//        printf("thread %d executed chunk %d [%lldx%lld]\n", ith, current_chunk, ir0_end - ir0_start, ir1_end - ir1_start);
         current_chunk = atomic_fetch_add_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
     }
 }
@@ -14236,28 +14209,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         printf("---- Node [%s] (%p)\n", cgraph->nodes[i]->name, cgraph->nodes[i]);
         
         if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
-//            float * a = malloc(ggml_nelements(cgraph->nodes[i]) * sizeof(float));
-//            float * b = malloc(ggml_nelements(cgraph->nodes[i]) * sizeof(float));
-//            
 //            ggml_compute_forward(&params, cgraph->nodes[i]);
-//            memcpy(a, cgraph->nodes[i]->data, ggml_nelements(cgraph->nodes[i]));
-//            
-//            printf("-------------------------------------------\n");
-//            memset(cgraph->nodes[i]->data, 0, ggml_nelements(cgraph->nodes[i]));
-            
             mulmat_with_two_threads(cgraph->nodes[i]);
-//            memcpy(b, cgraph->nodes[i]->data, ggml_nelements(cgraph->nodes[i]));
-            
-//            print_data(a, ggml_nelements(cgraph->nodes[i]));
-//            print_data(b, ggml_nelements(cgraph->nodes[i]));
-//            if (!is_data_equal(a, b, ggml_nelements(cgraph->nodes[i]))) {
-//                printf("Tensor [%s] result inconsistent\n", cgraph->nodes[i]->name);
-//            }
-            
             printf("[%s] (%p) finished!\n", cgraph->nodes[i]->name, cgraph->nodes[i]);
-//            
-//            free(a);
-//            free(b);
         } else {
             ggml_compute_forward(&params, cgraph->nodes[i]);
         }
