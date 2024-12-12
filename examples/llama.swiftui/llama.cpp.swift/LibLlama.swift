@@ -33,6 +33,7 @@ actor LlamaContext {
     private var temporary_invalid_cchars: [CChar]
 
     var n_len: Int32 = 128
+//    var n_len: Int32 = 64
     var n_cur: Int32 = 0
 
     var n_decode: Int32 = 0
