@@ -6229,12 +6229,6 @@ void free_hash_map(struct ptr_hash_map *map) {
     free(map);
 }
 
-// Helper function to calculate data size based on tensor dimensions and type
-size_t calculate_data_size(struct ggml_tensor *node) {
-    size_t element_size = ggml_type_size(node->type);
-    return element_size * node->ne[0] * node->ne[1] * node->ne[2] * node->ne[3];
-}
-
 static void update_child_data(struct ggml_tensor * tensor) {
     struct ggml_child_tensor_list * child = tensor->children;
     while (child) {
@@ -6252,7 +6246,6 @@ static void ggml_update_in_degree_dfs(struct ggml_tensor * node, struct ptr_hash
     }
     
     node->visited = true;
-//    node->child_has_been_enqueued = false;
     
     if (node->op == GGML_OP_MUL_MAT) {
         if (exists_in_map(data_map, node->data)) {
