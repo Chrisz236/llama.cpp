@@ -10636,7 +10636,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         const struct ggml_tensor * mask,
         struct ggml_tensor * dst) {
 
-    printf("flash attn\n");
+//    printf("flash attn\n");
     
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -10848,7 +10848,7 @@ static void ggml_compute_forward_flash_attn_ext_f16(
         // permute(0, 2, 1, 3)
         memcpy((char *) dst->data + (i3*ne2*ne1 + i2 + i1*ne1)*nb1, VKQ32, nb1);
     }
-    printf("end of flash attn\n");
+//    printf("end of flash attn\n");
 }
 
 static void ggml_compute_forward_flash_attn_ext(
@@ -12737,7 +12737,7 @@ static thread_ret_t ggml_mulmat_worker(void * data) {
     struct ggml_tensor * tensor = worker_args->tensor;
     struct ggml_threadpool * tp = worker_args->tp;
     
-    printf("\t- worker thread %d/%d [%s]\n", worker_args->ith, worker_args->nth, tensor->name);
+//    printf("\t- worker thread %d/%d [%s]\n", worker_args->ith, worker_args->nth, tensor->name);
     struct ggml_compute_params params = {
         .ith = worker_args->ith,
         .nth = worker_args->nth,
@@ -13742,7 +13742,7 @@ static thread_ret_t ggml_graph_compute_worker_thread(void * data) {
     struct worker_args * worker_args = (struct worker_args *) data;
     struct ggml_tensor * tensor = worker_args->tensor;
     
-    printf("\t- worker thread %d/%d [%s]\n", worker_args->ith, worker_args->nth, tensor->name);
+//    printf("\t- worker thread %d/%d [%s]\n", worker_args->ith, worker_args->nth, tensor->name);
     
     struct ggml_threadpool * dummy_threadpool = malloc(sizeof(struct ggml_threadpool));
     atomic_store(&dummy_threadpool->current_chunk, 0);
@@ -14208,8 +14208,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 //        printf("---- Node [%s] (%p)\n", cgraph->nodes[i]->name, cgraph->nodes[i]);
 //        
 //        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
-//            ggml_compute_forward(&params, cgraph->nodes[i]);
-////            mulmat_with_two_threads(cgraph->nodes[i]);
+////            ggml_compute_forward(&params, cgraph->nodes[i]);
+//            mulmat_with_two_threads(cgraph->nodes[i]);
 //            printf("[%s] (%p) finished!\n", cgraph->nodes[i]->name, cgraph->nodes[i]);
 //        } else {
 //            ggml_compute_forward(&params, cgraph->nodes[i]);
@@ -14251,17 +14251,16 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     // Topo execution
     while (!is_queue_empty(working_queue)) {
         const int queue_size = working_queue->size;
-        printf("---- Q: ");
         
+//        printf("---- Q: ");
         bool all_mulmat = true;
         struct ggml_queue_node * ptr = working_queue->front;
         for (int i = 0; i < queue_size; i++) {
-            printf("[%s] (%p) ", ptr->tensor->name, ptr->tensor);
-            if (ptr->tensor->op != GGML_OP_MUL_MAT) { all_mulmat = false; }
+//            printf("[%s] (%p) ", ptr->tensor->name, ptr->tensor);
+            if (ptr->tensor->op != GGML_OP_MUL_MAT) { all_mulmat = false; break; }
             ptr = ptr->next;
         }
-        
-        printf("\n");
+//        printf("\n");
         
         if (queue_size == 1) {
             struct ggml_tensor * node = dequeue(working_queue);
@@ -14276,6 +14275,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 pthread_t workers[NUM_WORKER_NODES * 2 + 1];  // extra one worker is prepared for [main + worker]
                 struct ggml_tensor * nodes[queue_size];       // enqueue_child_node at last
                 void * wdata_ptrs[queue_size];
+                struct worker_args * worker_argments[NUM_WORKER_NODES * 2 + 1];
+                struct ggml_threadpool * temp_pools[queue_size];
                 
                 int worker_idx = 0;
                 
@@ -14291,6 +14292,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                         
                         void * wdata = malloc(ggml_nbytes(node));
                         wdata_ptrs[i] = wdata;
+                        temp_pools[i] = threadpool;
                         
                         // worker 0, 1 belongs to same threadpool/node
                         // worker 2, 3 belongs to same threadpool/node
@@ -14301,7 +14303,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                             warg->tensor = node;
                             warg->tp = threadpool;
                             warg->wdata = wdata;
-                            
+                            worker_argments[worker_idx] = warg;
                             pthread_create(&workers[worker_idx], NULL, ggml_mulmat_worker, (void *)warg);
                             worker_idx++;
                         }
@@ -14319,17 +14321,19 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                     
                     void * wdata = malloc(ggml_nbytes(node));
                     wdata_ptrs[queue_size - 1] = wdata;
+                    temp_pools[queue_size - 1] = threadpool;
                     
-                    // ----- WORKER PART -----
+                    // ----- WORKER HALF -----
                     struct worker_args * warg = malloc(sizeof(struct worker_args));
                     warg->ith = 0;
                     warg->nth = 2;
                     warg->tensor = node;
                     warg->tp = threadpool;
                     warg->wdata = wdata;
+                    worker_argments[worker_idx] = warg;
                     pthread_create(&workers[worker_idx], NULL, ggml_mulmat_worker, (void *)warg);
                     
-                    // ----- MAIN PART -----
+                    // ----- MAIN HALF -----
                     struct ggml_compute_params params_main = {
                         .ith = 1,
                         .nth = 2,
@@ -14337,24 +14341,27 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                         .wdata = wdata,
                         .threadpool = threadpool,
                     };
-                    printf("\t- main   thread 1/%d [%s]\n", 2, node->name);
+//                    printf("\t- main   thread 1/2 [%s]\n", node->name);
                     ggml_compute_forward(&params_main, node);
                 }
 
                 // Main thread wait all worker to finish and enqueue its child
                 for (int i = 0; i < NUM_WORKER_NODES * 2 + 1; i++) {
                     pthread_join(workers[i], NULL);
+                    free(worker_argments[i]);
                 }
                 
                 for (int i = 0; i < queue_size; i++) {
                     enqueue_child_node(nodes[i], working_queue);
                     free(wdata_ptrs[i]);
+                    free(temp_pools[i]);
                 }
             } else {
                 // Do not run queue in multiple threads if they are not mulmat
                 const int num_workers = queue_size - 1;
                 pthread_t workers[num_workers];
                 struct ggml_tensor * worker_nodes[num_workers];
+                struct worker_args * worker_argments[num_workers];
                 
                 for (int i = 0; i < num_workers; i++) {
                     struct ggml_tensor * node = dequeue(working_queue);
@@ -14364,19 +14371,20 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                     warg->ith = 0;
                     warg->nth = 1;
                     warg->tensor = node;
-                    
+                    worker_argments[i] = warg;
                     pthread_create(&workers[i], NULL, ggml_graph_compute_worker_thread, (void *)warg);
                 }
                 
                 struct ggml_tensor * node = dequeue(working_queue);
                 
-                printf("\t- main   thread 0/1 [%s]\n", node->name);
+//                printf("\t- main   thread 0/1 [%s]\n", node->name);
                 ggml_compute_forward(&params, node);
                 enqueue_child_node(node, working_queue);
                 
                 for (int i = 0; i < num_workers; i++) {
                     pthread_join(workers[i], NULL);
                     enqueue_child_node(worker_nodes[i], working_queue);
+                    free(worker_argments[i]);
                 }
             }
         }
