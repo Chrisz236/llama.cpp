@@ -2299,6 +2299,7 @@ static void two_threads_barrier(struct ggml_threadpool * tp) {
     }
     
     while (atomic_load(&tp->n_barrier_passed) < 2) {
+        // first thread
         ;
     }
 }
@@ -12776,13 +12777,14 @@ static void mulmat_with_two_threads(struct ggml_tensor * tensor) {
         .wdata = wdata,
         .threadpool = dummy_threadpool,
     };
-    printf("\t- main   thread 1/%d [%s]\n", 2, tensor->name);
+//    printf("\t- main   thread 1/%d [%s]\n", 2, tensor->name);
     ggml_compute_forward(&params_main, tensor);
     
     pthread_join(worker, NULL);
     
     free(dummy_threadpool);
     free(wdata);
+    free(warg);
 }
 
 // -------- CHRIS WRAPPER API FOR GGML_COMPUTE_FORWARD --------
@@ -14252,15 +14254,15 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     while (!is_queue_empty(working_queue)) {
         const int queue_size = working_queue->size;
         
-//        printf("---- Q: ");
+        printf("---- Q: ");
         bool all_mulmat = true;
         struct ggml_queue_node * ptr = working_queue->front;
         for (int i = 0; i < queue_size; i++) {
-//            printf("[%s] (%p) ", ptr->tensor->name, ptr->tensor);
-            if (ptr->tensor->op != GGML_OP_MUL_MAT) { all_mulmat = false; break; }
+            printf("[%s] (%p) ", ptr->tensor->name, ptr->tensor);
+            if (ptr->tensor->op != GGML_OP_MUL_MAT) { all_mulmat = false; }
             ptr = ptr->next;
         }
-//        printf("\n");
+        printf("\n");
         
         if (queue_size == 1) {
             struct ggml_tensor * node = dequeue(working_queue);
@@ -14305,6 +14307,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                             warg->wdata = wdata;
                             worker_argments[worker_idx] = warg;
                             pthread_create(&workers[worker_idx], NULL, ggml_mulmat_worker, (void *)warg);
+//                            printf("worker %d assigned node [%s]\n", worker_idx, node->name);
                             worker_idx++;
                         }
                     }
@@ -14332,6 +14335,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                     warg->wdata = wdata;
                     worker_argments[worker_idx] = warg;
                     pthread_create(&workers[worker_idx], NULL, ggml_mulmat_worker, (void *)warg);
+//                    printf("worker %d assigned node [%s]\n", worker_idx, node->name);
                     
                     // ----- MAIN HALF -----
                     struct ggml_compute_params params_main = {
@@ -14356,6 +14360,18 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                     free(wdata_ptrs[i]);
                     free(temp_pools[i]);
                 }
+                
+//                struct ggml_tensor * nodes[queue_size];
+//                
+//                for (int i = 0; i < queue_size; i++) {
+//                    struct ggml_tensor * node = dequeue(working_queue);
+//                    nodes[i] = node;
+//                    mulmat_with_two_threads(node);
+//                }
+//                
+//                for (int i = 0; i < queue_size; i++) {
+//                    enqueue_child_node(nodes[i], working_queue);
+//                }
             } else {
                 // Do not run queue in multiple threads if they are not mulmat
                 const int num_workers = queue_size - 1;
