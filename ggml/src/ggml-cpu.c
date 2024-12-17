@@ -7532,27 +7532,37 @@ UseGgmlGemm1:;
     // Quantization, F32->F16
     // src1->type == GGML_TYPE_F32
     // vec_dot_type == GGML_TYPE_F16
-    if (src1->type != vec_dot_type) {
-        char * wdata = params->wdata;
-        
-        const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
-        const size_t nbw2 = nbw1*ne11;
-        const size_t nbw3 = nbw2*ne12;
-        
-        assert(params->wsize >= ne13*nbw3);
-        GGML_ASSERT(src1->type == GGML_TYPE_F32);
-        
-        for (int64_t i13 = 0; i13 < ne13; ++i13) {
-            for (int64_t i12 = 0; i12 < ne12; ++i12) {
-                for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
-                    from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
-                               (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
-                               ne10);
+    if ((nth == 1) || (nth == 2 && ith == 0)) {
+        if (src1->type != vec_dot_type) {
+            char * wdata = params->wdata;
+            
+            const size_t nbw1 = ggml_row_size(vec_dot_type, ne10);
+            const size_t nbw2 = nbw1*ne11;
+            const size_t nbw3 = nbw2*ne12;
+            
+            assert(params->wsize >= ne13*nbw3);
+            GGML_ASSERT(src1->type == GGML_TYPE_F32);
+            
+            for (int64_t i13 = 0; i13 < ne13; ++i13) {
+                for (int64_t i12 = 0; i12 < ne12; ++i12) {
+                    if (nth == 2) {
+                        for (int64_t i11 = ith; i11 < ne11; i11 += 1) {
+                            from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
+                                       (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
+                                       ne10);
+                        }
+                    } else {
+                        for (int64_t i11 = ith; i11 < ne11; i11 += nth) {
+                            from_float((float *)((char *) src1->data + i13*nb13 + i12*nb12 + i11*nb11),
+                                       (void *)               (wdata + i13*nbw3 + i12*nbw2 + i11*nbw1),
+                                       ne10);
+                        }
+                    }
                 }
             }
         }
     }
-        
+    
     // Only thread 0 is setting up the current_chunk to nth
     if (nth == 1) {
         atomic_store_explicit(&params->threadpool->current_chunk, 1, memory_order_relaxed);
@@ -12754,12 +12764,12 @@ static thread_ret_t ggml_mulmat_worker(void * data) {
 }
 
 // Whoever calls this function will execute half of the tensor
-static void mulmat_with_two_threads(struct ggml_tensor * tensor) {
+static void mulmat_with_two_threads(struct ggml_tensor * tensor, const size_t work_size) {
     struct ggml_threadpool * dummy_threadpool = malloc(sizeof(struct ggml_threadpool));
     atomic_store(&dummy_threadpool->current_chunk, 2);
     atomic_store(&dummy_threadpool->n_barrier_passed, 0);
     
-    void * wdata = malloc(ggml_nbytes(tensor));
+    void * wdata = malloc(work_size);
     
     // ----- MULMAT WORKER PART -----
     pthread_t worker;
@@ -14542,15 +14552,15 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     
     // ------- FOR LOOP ---------
     for (int i = 0; i < cgraph->n_nodes; i++) {
-//        printf("---- Node [%s] (%p)\n", cgraph->nodes[i]->name, cgraph->nodes[i]);
+        printf("---- Node [%s] (%p)\n", cgraph->nodes[i]->name, cgraph->nodes[i]);
         
-//        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
-////            ggml_compute_forward(&params, cgraph->nodes[i]);
-//            mulmat_with_two_threads(cgraph->nodes[i]);
-////            printf("[%s] (%p) finished!\n", cgraph->nodes[i]->name, cgraph->nodes[i]);
-//        } else {
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+//            ggml_compute_forward(&params, cgraph->nodes[i]);
+            mulmat_with_two_threads(cgraph->nodes[i], cplan->work_size);
+            printf("[%s] (%p) finished!\n", cgraph->nodes[i]->name, cgraph->nodes[i]);
+        } else {
             ggml_compute_forward(&params, cgraph->nodes[i]);
-//        }
+        }
         
         cgraph->nodes[i]->executed = true;
     }
