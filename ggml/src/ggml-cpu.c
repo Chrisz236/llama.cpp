@@ -14708,20 +14708,26 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         .threadpool = dummy_threadpool,
     };
     
-//    // ------- FOR LOOP ---------
-//    for (int i = 0; i < cgraph->n_nodes; i++) {
-////        printf("----F Node [%s] (%p) \"%s\"\n", cgraph->nodes[i]->name, cgraph->nodes[i], ggml_op_name(cgraph->nodes[i]->op));
-//        
-//        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
-//            mulmat_with_two_threads(cgraph->nodes[i], cplan->work_size);
-//        } else {
-//            ggml_compute_forward(&params, cgraph->nodes[i]);
-//        }
-//        
-//        cgraph->nodes[i]->executed = true;
-//    }
-//    // ------- FOR LOOP ---------
+#define TOPO_EXECUTION
+//#define SIMPLE_TOPO
+
+#ifndef TOPO_EXECUTION
+    // ------- FOR LOOP ---------
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+//        printf("----F Node [%s] (%p) \"%s\"\n", cgraph->nodes[i]->name, cgraph->nodes[i], ggml_op_name(cgraph->nodes[i]->op));
+        
+        if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
+            mulmat_with_two_threads(cgraph->nodes[i], cplan->work_size);
+        } else {
+            ggml_compute_forward(&params, cgraph->nodes[i]);
+        }
+        
+        cgraph->nodes[i]->executed = true;
+    }
+    // ------- FOR LOOP ---------
+#endif
     
+#ifdef TOPO_EXECUTION
     void * kq_mask_ptr = NULL;
     
     // Enqueue initial in_degree == 0 node and executed it directly in main thread
@@ -14742,16 +14748,28 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             enqueue(working_queue, cgraph->nodes[i]);
         }
     }
-    
+
     // One pass run of initial queue, mostly VIEW operator, fast on main thread
     const int init_queue_size = working_queue->size;
     for (int i = 0; i < init_queue_size; i++) {
         struct ggml_tensor * node = dequeue(working_queue);
-//        printf("----T Node [%s] (%p) \"%s\"\n", node->name, node, ggml_op_name(node->op));
         ggml_compute_forward(&params, node);
         enqueue_child_node(cgraph, node, working_queue);
     }
 
+#ifdef SIMPLE_TOPO
+    while (!is_queue_empty(working_queue)) {
+        struct ggml_tensor * node = dequeue(working_queue);
+        if (node->op == GGML_OP_MUL_MAT) {
+            mulmat_with_two_threads(node, cplan->work_size);
+        } else {
+            ggml_compute_forward(&params, node);
+        }
+        enqueue_child_node(cgraph, node, working_queue);
+    }
+#endif
+
+#ifndef SIMPLE_TOPO
     // Topo execution
     while (!is_queue_empty(working_queue)) {
         const int queue_size = working_queue->size;
@@ -14899,12 +14917,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             }
         }
     }
-
-    
+#endif
     free(kq_mask_ptr);
-    free(dummy_threadpool);
+#endif
+    
+    free_hash_set(hashset);
     free_children_list(cgraph);
-    //    free_hash_set(hashset);
+    free(dummy_threadpool);
     
     return GGML_STATUS_SUCCESS;
 }
