@@ -7467,7 +7467,9 @@ static void ggml_compute_forward_mul_mat(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
-
+    
+    printf("mulmat [%s]\n", dst->name);
+    
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;
@@ -8435,10 +8437,8 @@ static void ggml_compute_forward_get_rows_f16(
 
     const struct ggml_tensor * src0 = dst->src[0];
     const struct ggml_tensor * src1 = dst->src[1];
-    
-//    printf("src0: %p\n", src0);
-//    printf("src1: %p\n", src1);
-//    printf("dst: %p\n", dst);
+
+    printf("get_row_f16 dst->name: %s\n", dst->name);
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -8519,8 +8519,8 @@ static void ggml_compute_forward_get_rows_f32(
         const struct ggml_compute_params * params,
               struct ggml_tensor * dst) {
 
-    const struct ggml_tensor * src0 = dst->src[0];
-    const struct ggml_tensor * src1 = dst->src[1];
+    const struct ggml_tensor * src0 = dst->src[0];   // src0 is source tensor that to be picked
+    const struct ggml_tensor * src1 = dst->src[1];   // src1 is row index (integers), indicate which rows should pick from src0
 
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -14170,11 +14170,56 @@ static void threadpool_free(struct ggml_threadpool * tp) {
     }
 }
 
-static void print_data(const float * a, long size) {
-    printf("data: [");
-    for (long i = 0; i < size; i++) {
-        printf("(%ld)%f, ",i , a[i]);
+static void print_data(const float * a, long size, enum ggml_type type) {
+    printf("data (%s): [", ggml_type_name(type));
+    switch (type) {
+        case GGML_TYPE_F32:
+        {
+            for (long i = 0; i < size; i++) {
+                printf("(%ld)%f, ",i , (float)a[i]);
+            }
+            break;
+        }
+        case GGML_TYPE_BF16:
+        case GGML_TYPE_I16:
+        case GGML_TYPE_F16: {
+            for (long i = 0; i < size; i++) {
+                printf("(%ld)%hd, ",i , (int16_t)a[i]);
+            }
+            break;
+        }
+        case GGML_TYPE_Q8_0:
+        case GGML_TYPE_Q8_1:
+        case GGML_TYPE_Q8_K:
+        case GGML_TYPE_I8: {
+            for (long i = 0; i < size; i++) {
+                printf("(%ld)%hd, ",i , (int8_t)a[i]);
+            }
+            break;
+        }
+        case GGML_TYPE_I32: {
+            for (long i = 0; i < size; i++) {
+                printf("(%ld)%d, ",i , (int32_t)a[i]);
+            }
+            break;
+        }
+        case GGML_TYPE_I64: {
+            for (long i = 0; i < size; i++) {
+                printf("(%ld)%lld, ",i , (int64_t)a[i]);
+            }
+            break;
+        }
+        case GGML_TYPE_F64: {
+            for (long i = 0; i < size; i++) {
+                printf("(%ld)%f, ",i , (double)a[i]);
+            }
+            break;
+        }
+        default: {
+            printf("ERROR: Type %s print data has not implemented yet!\n", ggml_type_name(type));
+        }
     }
+
     printf("]\n");
 }
 
@@ -14285,6 +14330,29 @@ void * allocate_for_collision(PointerHashSet* set, void* original_ptr, size_t si
     return new_ptr;
 }
 
+// Allocate new memory and copy data from the original pointer
+void * allocate_copy(PointerHashSet* set, void* original_ptr, size_t size) {
+    // Check if we've reached max allocations
+    if (set->current_allocation_count >= set->max_allocations) {
+        return NULL;
+    }
+    
+    // Allocate new memory
+    void * new_ptr = malloc(size);
+    if (!new_ptr) return NULL;
+    
+    // Copy original data
+    memcpy(new_ptr, original_ptr, size);
+    
+    // Track the allocation
+    size_t index = set->current_allocation_count++;
+    set->allocations[index].original_ptr = original_ptr;
+    set->allocations[index].new_allocated_ptr = new_ptr;
+    set->allocations[index].size = size;
+    
+    return new_ptr;
+}
+
 // Resize the hashset when it gets too full
 static bool resize_hash_set(PointerHashSet* set) {
     size_t new_capacity = set->capacity * 2;
@@ -14353,6 +14421,55 @@ void * insert_into_hash_set(PointerHashSet* set, void * ptr, struct ggml_tensor 
     }
 
     return NULL; // Should not happen if resize logic is correct
+}
+
+// Insert a pointer into the hashset, always allocate a new buffer
+void * insert_into_hash_set_regardless_collision(PointerHashSet* set, void * ptr, struct ggml_tensor * node) {
+    if (!set || !ptr) return NULL;
+
+    // Always allocate a new copy of the data
+    size_t data_size = ggml_nbytes(node);
+    void * new_ptr = allocate_copy(set, ptr, data_size);
+    if (!new_ptr) return NULL;
+
+    // Check if we need to resize
+    if ((float)set->used_slots / set->capacity >= HASH_SET_LOAD_FACTOR) {
+        if (!resize_hash_set(set)) {
+            // If resize fails, free the newly allocated pointer manually
+            // since we won't track it in the set (though we should track it if needed)
+            // But since we haven't inserted into the set yet, let's not lose track:
+            set->current_allocation_count--;
+            free(new_ptr);
+            return NULL;
+        }
+    }
+
+    size_t index = hash_pointer(ptr, set->capacity);
+
+    // Linear probing to find insertion point
+    for (size_t i = 0; i < set->capacity; i++) {
+        size_t current = (index + i) % set->capacity;
+
+        // Empty slot found
+        if (set->buckets[current] == NULL) {
+            set->buckets[current] = ptr;  // Store the original pointer as the key
+            set->size++;
+            set->used_slots++;
+            return new_ptr;  // Return the newly allocated pointer
+        }
+
+        // If the pointer is already in the set, we still return a new allocated pointer
+        if (set->buckets[current] == ptr) {
+            // We have a duplicate, but as per request, we have already allocated a new memory.
+            return new_ptr;
+        }
+    }
+
+    // Should not happen if resize logic is correct
+    // But in an edge case, roll back the allocation and return NULL
+    set->current_allocation_count--;
+    free(new_ptr);
+    return NULL;
 }
 
 // Free all tracked allocations and the hashset
@@ -14539,32 +14656,33 @@ static void inspect_tensor(const struct ggml_tensor * tensor) {
     printf("- Number of source: %d\n", src_count);
     printf("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n");
     printf("-> self data (%p): \n", tensor->data);
-    print_data(tensor->data, ggml_nelements(tensor));
+    print_data(tensor->data, ggml_nelements(tensor), tensor->type);
     printf("\n");
     
     for (int i = 0; i < src_count; i++) {
         printf("@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@@\n");
         printf("\t-> src%d [%s] \"%s\" data (%p): \n", i, tensor->src[i]->name, ggml_op_name(tensor->src[i]->op), tensor->src[i]->data);
-        print_data(tensor->src[i]->data, ggml_nelements(tensor->src[i]));
+        print_data(tensor->src[i]->data, ggml_nelements(tensor->src[i]), tensor->src[i]->type);
         printf("\n");
     }
 }
 
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     const int n_nodes = cgraph->n_nodes;
-    PointerHashSet * hashset = init_hash_set(n_nodes);
+    
     build_children_list(cgraph);
-//    print_children_list(cgraph);
-
+    PointerHashSet * hashset = init_hash_set(n_nodes);
+    
     for (int i = 0; i < n_nodes; i++) {
         if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT ||
             cgraph->nodes[i]->op == GGML_OP_RMS_NORM ||
             cgraph->nodes[i]->op == GGML_OP_MUL ||
             cgraph->nodes[i]->op == GGML_OP_ROPE ||
             cgraph->nodes[i]->op == GGML_OP_FLASH_ATTN_EXT ||
-            cgraph->nodes[i]->op == GGML_OP_ADD) {
+            cgraph->nodes[i]->op == GGML_OP_ADD ||
+            cgraph->nodes[i]->op == GGML_OP_GET_ROWS) {
             printf("[%s] data ptr (%p)\n", cgraph->nodes[i]->name, cgraph->nodes[i]->data);
-            void * existing_ptr = insert_into_hash_set(hashset, cgraph->nodes[i]->data, cgraph->nodes[i]);
+            void * existing_ptr = insert_into_hash_set_regardless_collision(hashset, cgraph->nodes[i]->data, cgraph->nodes[i]);
             if (existing_ptr != cgraph->nodes[i]->data) {
                 printf("[%s] assigned new data ptr! old: %p, new: %p\n", cgraph->nodes[i]->name, cgraph->nodes[i]->data, existing_ptr);
                 cgraph->nodes[i]->data = existing_ptr;
@@ -14572,7 +14690,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             }
         }
     }
-    
+
     ggml_cpu_init();
     
     GGML_ASSERT(cplan);
@@ -14657,14 +14775,29 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     }
         
     while (!is_queue_empty(working_queue)) {
+        const int queue_size = working_queue->size;
+        
+        printf("---- Q: ");
+        struct ggml_queue_node * ptr = working_queue->front;
+        for (int i = 0; i < queue_size; i++) {
+            printf("[%s] (%p) ", ptr->tensor->name, ptr->tensor);
+            ptr = ptr->next;
+        }
+        printf("\n");
+        
         struct ggml_tensor * node = dequeue(working_queue);
 //        printf("\t----T Node [%s] (%p) \"%s\"\n", node->name, node, ggml_op_name(node->op));
         
-        // FIXME: When running layer 16, ROPE will access incorrect inp_pos tensor, use w s e -- address to check who changed the inp_pos
-        if (strcmp(node->name, "Qcur-14") == 0 && node->op == GGML_OP_ROPE) {
-            inspect_tensor(node);
-            printf("asdasd\n");
-        }
+//        if (strcmp(node->name, "Qcur-0") == 0 && node->op == GGML_OP_ROPE) {
+//            inspect_tensor(node);
+//            printf("asdasd\n");
+//        }
+//        
+//        // FIXME: kqv_out-15's memcpy is accessing `inp_pos` data
+//        if (strcmp(node->name, "kqv_out-15") == 0 && node->op == GGML_OP_MUL_MAT) {
+////            inspect_tensor(node);
+//            printf("kqv_out-15\n");
+//        }
         
         ggml_compute_forward(&params, node);
         
@@ -14675,8 +14808,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         enqueue_child_node(cgraph, node, working_queue);
     }
     
-//    printf("All queue finished!\n");
-    exit(0);
+    printf("All queue finished!\n");
+//    exit(0);
 
 //    // Topo execution
 //    while (!is_queue_empty(working_queue)) {
@@ -14829,7 +14962,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     
 //    free(kq_mask_ptr);
     free(dummy_threadpool);
-    free_hash_set(hashset);
+//    free_hash_set(hashset);
     free_children_list(cgraph);
     
     return GGML_STATUS_SUCCESS;
