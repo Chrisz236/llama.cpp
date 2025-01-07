@@ -14733,6 +14733,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 void * wdata_ptrs[queue_size];
                 struct ggml_tensor * nodes[queue_size];
                 struct worker_args * worker_argments[NUM_WORKER_NODES * 2 + 1];
+                atomic_int * current_chunk_array[queue_size];
+                atomic_int * n_barrier_passed_array[queue_size];
                 
                 int worker_idx = 0;
                 
@@ -14745,11 +14747,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                         void * wdata = malloc(cplan->work_size);
                         wdata_ptrs[i] = wdata;
                         
-                        atomic_int *current_chunk = malloc(sizeof(atomic_int));
+                        atomic_int * current_chunk = malloc(sizeof(atomic_int));
                         atomic_init(current_chunk, 2);
+                        current_chunk_array[i] = current_chunk;
 
-                        atomic_int *n_barrier_passed = malloc(sizeof(atomic_int));
+                        atomic_int * n_barrier_passed = malloc(sizeof(atomic_int));
                         atomic_init(n_barrier_passed, 0);
+                        n_barrier_passed_array[i] = n_barrier_passed;
                         
                         struct worker_args * warg0 = malloc(sizeof(struct worker_args));
                         warg0->ith = 0;
@@ -14785,11 +14789,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                     void * wdata = malloc(cplan->work_size);
                     wdata_ptrs[NUM_WORKER_NODES] = wdata;
                     
-                    atomic_int *current_chunk = malloc(sizeof(atomic_int));
+                    atomic_int * current_chunk = malloc(sizeof(atomic_int));
                     atomic_init(current_chunk, 2);
+                    current_chunk_array[NUM_WORKER_NODES] = current_chunk;
 
-                    atomic_int *n_barrier_passed = malloc(sizeof(atomic_int));
+                    atomic_int * n_barrier_passed = malloc(sizeof(atomic_int));
                     atomic_init(n_barrier_passed, 0);
+                    n_barrier_passed_array[NUM_WORKER_NODES] = n_barrier_passed;
                     
                     struct worker_args * warg0 = malloc(sizeof(struct worker_args));
                     warg0->ith = 0;
@@ -14845,6 +14851,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 for (int i = 0; i < queue_size; i++) {
                     enqueue_child_node(cgraph, nodes[i], working_queue);
                     free(wdata_ptrs[i]);
+                    free(current_chunk_array[i]);
+                    free(n_barrier_passed_array[i]);
                 }
                 
                 free(task_list);
