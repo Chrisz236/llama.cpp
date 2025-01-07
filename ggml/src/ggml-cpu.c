@@ -7603,7 +7603,11 @@ UseGgmlGemm1:;
     }
         
     if (nth == 2) {
-        two_threads_barrier_with_wargs(params->wargs);
+        if (params->wargs){
+            two_threads_barrier_with_wargs(params->wargs);
+        } else {
+            two_threads_barrier(params->threadpool);
+        }
     }
     
 #if GGML_USE_LLAMAFILE
@@ -14701,9 +14705,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 #endif
 
 #ifndef SIMPLE_TOPO
-    // TODO: Finish threadpool main thread part
     struct ggml_threadpool_params tp_params = ggml_threadpool_params_default(5);
-    struct ggml_threadpool * threadpool = ggml_threadpool_5_workers(&tp_params, cgraph, cplan);  // spawn 5 workers threads here, they will all jam at cond variable
+    struct ggml_threadpool * threadpool = ggml_threadpool_5_workers(&tp_params, cgraph, cplan);  // spawn 5 workers threads here
     
     // Topo execution
     while (!is_queue_empty(working_queue)) {
