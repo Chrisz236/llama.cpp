@@ -14933,7 +14933,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 double duration_us = seconds * 1e6 + nanoseconds / 1e3;
                 double duration_s = duration_us / 1e6; // Convert duration to seconds
                 double bandwidth = (double)total_bytes_io / duration_s / 1e9;
-                printf("->Queue total time: %.2f us | total IO: %.4f MB | bandwidth: %.2f GB/s\n", duration_us, ((double)total_bytes_io / 1e6), bandwidth);
+                printf("->Threadpool total time: %.2f us | total IO: %.4f MB | bandwidth: %.2f GB/s\n", duration_us, ((double)total_bytes_io / 1e6), bandwidth);
 #endif
                 
                 for (int i = 0; i < NUM_WORKER_NODES * 2 + 1; i++) {
