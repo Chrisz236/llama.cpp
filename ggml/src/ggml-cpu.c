@@ -14595,6 +14595,55 @@ void threadpool_wait_all(struct ggml_threadpool * pool) {
     ggml_mutex_unlock(&pool->mutex);
 }
 
+long get_memory_io_count(struct ggml_tensor * tensor) {
+    // Precondition: tensor->op == GGML_OP_MULMAT
+    // and tensor->src[0], tensor->src[1] are not NULL.
+
+    struct ggml_tensor * A = tensor->src[0];
+    struct ggml_tensor * B = tensor->src[1];
+    struct ggml_tensor * C = tensor;  // The output = "dst"
+
+    long nA = A->ne[0] * A->ne[1];
+    long nB = B->ne[0] * B->ne[1];
+    long nC = C->ne[0] * C->ne[1];
+
+    // If A is F16, B is F32, the process is:
+    //  1) read A in F16
+    //  2) read B in F32
+    //  3) quantize B => write working buffer in F16
+    //  4) read working buffer in F16
+    //  5) write final C in F32
+    // So total reads = nA*2 + nB*4 + nB*2
+    //    total writes = nB*2 + nC*4
+
+    if (A->type == GGML_TYPE_F16 && B->type == GGML_TYPE_F32) {
+        long reads  = nA*2 + nB*4 + nB*2;
+        long writes = nB*2 + nC*4;
+        return reads + writes;
+    }
+
+    // Otherwise, for brevity, assume "all F32" or "all F16" fallback:
+    // (You can adapt this to your full logic.)
+    // e.g., if all F32 => readA + readB + writeC = 4*nA + 4*nB + 4*nC
+    // if all F16 => readA + readB + writeC = 2*nA + 2*nB + 4*nC (final stored in F32)
+    // This is just a naive fallback example:
+
+    if (A->type == GGML_TYPE_F32 && B->type == GGML_TYPE_F32) {
+        // everything in F32, final in F32
+        long reads  = (nA * 4) + (nB * 4);
+        long writes = (nC * 4);
+        return reads + writes;
+    } else if (A->type == GGML_TYPE_F16 && B->type == GGML_TYPE_F16) {
+        // both in F16, final dequant to F32
+        long reads  = (nA * 2) + (nB * 2);
+        long writes = (nC * 4);
+        return reads + writes;
+    }
+
+    // Fallback if we hit some other combination:
+    return 0;
+}
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     const int n_nodes = cgraph->n_nodes;
     
@@ -14645,6 +14694,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     
 #define TOPO_EXECUTION
 //#define SIMPLE_TOPO
+#define BENCHMARK_MEMORY_BANDWIDTH
 
 #ifndef TOPO_EXECUTION
     // ------- FOR LOOP ---------
@@ -14695,11 +14745,28 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 #ifdef SIMPLE_TOPO
     while (!is_queue_empty(working_queue)) {
         struct ggml_tensor * node = dequeue(working_queue);
+        
         if (node->op == GGML_OP_MUL_MAT) {
+#ifdef BENCHMARK_MEMORY_BANDWIDTH
+            long total_bytes_io = get_memory_io_count(node);
+            struct timespec start, end;
+            clock_gettime(CLOCK_MONOTONIC, &start);
+#endif
             mulmat_with_two_threads(node, cplan->work_size);
+            
+#ifdef BENCHMARK_MEMORY_BANDWIDTH
+            clock_gettime(CLOCK_MONOTONIC, &end);
+            long seconds = end.tv_sec - start.tv_sec;
+            long nanoseconds = end.tv_nsec - start.tv_nsec;
+            double duration_us = seconds * 1e6 + nanoseconds / 1e3;
+            double duration_s = duration_us / 1e6; // Convert duration to seconds
+            double bandwidth = (double)total_bytes_io / duration_s / 1e9;
+            printf("->Two threads mulmat total time: %.2f us | total IO: %.4f MB | bandwidth: %.2f GB/s\n", duration_us, ((double)total_bytes_io / 1e6), bandwidth);
+#endif
         } else {
             ggml_compute_forward(&params, node);
         }
+        
         enqueue_child_node(cgraph, node, working_queue);
     }
 #endif
@@ -14740,12 +14807,18 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 atomic_int * n_barrier_passed_array[queue_size];
                 
                 int worker_idx = 0;
-                
+
+                long total_bytes_io = 0;
+                struct timespec start, end;
+
                 {
                     // During node splitting:
                     for (int i = 0; i < NUM_WORKER_NODES; i++) {
                         struct ggml_tensor * node = dequeue(working_queue);
                         nodes[i] = node;
+                        
+                        long io_bytes = get_memory_io_count(node);
+                        total_bytes_io += io_bytes;
                         
                         void * wdata = malloc(cplan->work_size);
                         wdata_ptrs[i] = wdata;
@@ -14788,6 +14861,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 {
                     struct ggml_tensor * node = dequeue(working_queue);
                     nodes[NUM_WORKER_NODES] = node;
+                    
+                    long io_bytes = get_memory_io_count(node);
+                    total_bytes_io += io_bytes;
                     
                     void * wdata = malloc(cplan->work_size);
                     wdata_ptrs[NUM_WORKER_NODES] = wdata;
@@ -14838,6 +14914,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                     ggml_cond_broadcast(&threadpool->cond);
                     ggml_mutex_unlock(&threadpool->mutex);
                     
+                    clock_gettime(CLOCK_MONOTONIC, &start);
+                    
 //                    printf("\t- main get [%s], ith = 1, nth = 2\n", node->name);
                     ggml_compute_forward(&params_main, node);
 //                    printf("\t- main finished [%s], ith = 1, nth = 2\n", node->name);
@@ -14846,6 +14924,17 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 }
                 
                 threadpool_wait_all(threadpool);
+                
+                clock_gettime(CLOCK_MONOTONIC, &end);
+
+#ifdef BENCHMARK_MEMORY_BANDWIDTH
+                long seconds = end.tv_sec - start.tv_sec;
+                long nanoseconds = end.tv_nsec - start.tv_nsec;
+                double duration_us = seconds * 1e6 + nanoseconds / 1e3;
+                double duration_s = duration_us / 1e6; // Convert duration to seconds
+                double bandwidth = (double)total_bytes_io / duration_s / 1e9;
+                printf("->Queue total time: %.2f us | total IO: %.4f MB | bandwidth: %.2f GB/s\n", duration_us, ((double)total_bytes_io / 1e6), bandwidth);
+#endif
                 
                 for (int i = 0; i < NUM_WORKER_NODES * 2 + 1; i++) {
                     free(worker_argments[i]);
