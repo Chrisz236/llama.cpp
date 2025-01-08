@@ -14596,51 +14596,96 @@ void threadpool_wait_all(struct ggml_threadpool * pool) {
 }
 
 long get_memory_io_count(struct ggml_tensor * tensor) {
-    // Precondition: tensor->op == GGML_OP_MULMAT
-    // and tensor->src[0], tensor->src[1] are not NULL.
-
-    struct ggml_tensor * A = tensor->src[0];
-    struct ggml_tensor * B = tensor->src[1];
-    struct ggml_tensor * C = tensor;  // The output = "dst"
-
+    static const long BLOCK_SIZE_Q4 = 144; // block_q4_K
+    static const long BLOCK_SIZE_Q6 = 210; // block_q6_K
+    static const long BLOCK_SIZE_Q8 = 292; // block_q8_K
+    
+    struct ggml_tensor * A = tensor->src[0];  // "A"
+    struct ggml_tensor * B = tensor->src[1];  // "B"
+    struct ggml_tensor * C = tensor;          // "dst"
+    
     long nA = A->ne[0] * A->ne[1];
     long nB = B->ne[0] * B->ne[1];
     long nC = C->ne[0] * C->ne[1];
-
-    // If A is F16, B is F32, the process is:
-    //  1) read A in F16
-    //  2) read B in F32
-    //  3) quantize B => write working buffer in F16
-    //  4) read working buffer in F16
-    //  5) write final C in F32
-    // So total reads = nA*2 + nB*4 + nB*2
-    //    total writes = nB*2 + nC*4
-
+    
+    long nBlockA = nA / QK_K;  // # blocks in A
+    long nBlockB = nB / QK_K;  // # blocks in B
+    
+    //--------------------------------------------------------
+    // 1) Q4_K or Q6_K for src[0], F32 for src[1]
+    //    => A is read in Q4/Q6 blocks
+    //       B is read in F32, then written in Q8 blocks
+    //       no extra writes for A's "unpacked" data
+    //       final result is written in F32
+    if ((A->type == GGML_TYPE_Q4_K || A->type == GGML_TYPE_Q6_K) &&
+        (B->type == GGML_TYPE_F32)) {
+        
+        // Determine block size for A (Q4_K vs Q6_K):
+        long blockSizeA = (A->type == GGML_TYPE_Q4_K)
+        ? BLOCK_SIZE_Q4
+        : BLOCK_SIZE_Q6;
+        
+        // (1) read B in F32
+        long readB_f32 = 4 * nB;
+        
+        // (2) write B in Q8
+        long writeB_q8 = nBlockB * BLOCK_SIZE_Q8;
+        
+        // (3) read A in Q4/Q6
+        long readA = nBlockA * blockSizeA;
+        
+        // (4) read B in Q8
+        long readB_q8 = nBlockB * BLOCK_SIZE_Q8;
+        
+        // (5) write C in F32
+        long writeC_f32 = 4 * nC;
+        
+        long total = readB_f32 + writeB_q8
+        + readA
+        + readB_q8
+        + writeC_f32;
+        
+        return total;
+    }
+    
+    //--------------------------------------------------------
+    // 2) Example path: A=F16, B=F32
+    //    (already in your code or previous snippet)
     if (A->type == GGML_TYPE_F16 && B->type == GGML_TYPE_F32) {
-        long reads  = nA*2 + nB*4 + nB*2;
-        long writes = nB*2 + nC*4;
+        // read A in F16 => 2*nA
+        // read B in F32 => 4*nB
+        // quantize B => 2*nB
+        // read that F16 buffer => 2*nB
+        // write final => 4*nC
+        long reads  = (nA * 2) + (nB * 4) + (nB * 2);
+        long writes = (nB * 2) + (nC * 4);
         return reads + writes;
     }
-
-    // Otherwise, for brevity, assume "all F32" or "all F16" fallback:
-    // (You can adapt this to your full logic.)
-    // e.g., if all F32 => readA + readB + writeC = 4*nA + 4*nB + 4*nC
-    // if all F16 => readA + readB + writeC = 2*nA + 2*nB + 4*nC (final stored in F32)
-    // This is just a naive fallback example:
-
+    
+    //--------------------------------------------------------
+    // 3) Example path: A=F32, B=F32
     if (A->type == GGML_TYPE_F32 && B->type == GGML_TYPE_F32) {
-        // everything in F32, final in F32
-        long reads  = (nA * 4) + (nB * 4);
-        long writes = (nC * 4);
-        return reads + writes;
-    } else if (A->type == GGML_TYPE_F16 && B->type == GGML_TYPE_F16) {
-        // both in F16, final dequant to F32
-        long reads  = (nA * 2) + (nB * 2);
-        long writes = (nC * 4);
+        // read A => 4*nA
+        // read B => 4*nB
+        // write C => 4*nC
+        long reads  = 4*nA + 4*nB;
+        long writes = 4*nC;
         return reads + writes;
     }
-
-    // Fallback if we hit some other combination:
+    
+    //--------------------------------------------------------
+    // 4) Example path: A=F16, B=F16 => final in F32
+    if (A->type == GGML_TYPE_F16 && B->type == GGML_TYPE_F16) {
+        // read A => 2*nA
+        // read B => 2*nB
+        // write C => 4*nC
+        long reads  = 2*nA + 2*nB;
+        long writes = 4*nC;
+        return reads + writes;
+    }
+    
+    //--------------------------------------------------------
+    // Fallback
     return 0;
 }
 
