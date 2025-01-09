@@ -1298,21 +1298,6 @@ typedef pthread_mutex_t    ggml_mutex_t;
 
 #endif
 
-// subpool will handle actual node to execute
-struct ggml_subpool {
-    ggml_mutex_t mutex;
-    
-    atomic_int subpool_id;
-    atomic_int n_threads_ready;
-    atomic_int barrier_counter;
-    atomic_int state;               // Represents pool state (NOT_READY, READY, BUSY)
-    atomic_int current_chunk;
-    
-    struct ggml_node_scheduler * scheduler;
-    
-    struct ggml_tensor * current_node; // Node assigned to this subpool
-};
-
 // Threadpool def
 struct ggml_threadpool {
     ggml_mutex_t mutex;       // mutex for cond.var
@@ -1342,7 +1327,7 @@ struct ggml_threadpool {
     enum ggml_status ec;
     
     // --- New fields for the task queue ---
-    struct worker_args ** task_queue;
+    struct worker_args * assigned_tasks[5];
     int task_queue_size;
     int task_queue_capacity;
 
@@ -13801,24 +13786,22 @@ static thread_ret_t ggml_graph_compute_worker_thread(void * data) {
 static thread_ret_t ggml_threadpool_worker_thread(void * data) {
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool * tp = state->threadpool;
+    const int worker_tid = state->ith;
     
     while (true) {
         ggml_mutex_lock(&tp->mutex);
         
-        while (tp->task_queue_size == 0 && !atomic_load(&tp->stop)) {
+        while (tp->assigned_tasks[worker_tid] == NULL && !tp->stop) {
             ggml_cond_wait(&tp->cond, &tp->mutex);
         }
         
-        if (tp->stop)
-        {
+        if (tp->stop) {
             ggml_mutex_unlock(&tp->mutex);
             break;
         }
         
-        struct worker_args * warg = NULL;
-        if (tp->task_queue_size > 0) {
-            warg = tp->task_queue[--tp->task_queue_size];
-        }
+        struct worker_args * warg = tp->assigned_tasks[worker_tid];
+        tp->assigned_tasks[worker_tid] = NULL;
         
         ggml_mutex_unlock(&tp->mutex);
         
@@ -13982,9 +13965,9 @@ static struct ggml_threadpool * ggml_threadpool_5_workers(
     threadpool->prio = tpp->prio;
     threadpool->ec = GGML_STATUS_SUCCESS;
 
-    threadpool->task_queue_capacity = GGML_MAX_QUEUE_SIZE;
-    threadpool->task_queue_size = 0;
-    threadpool->task_queue = malloc(sizeof(struct worker_args*) * threadpool->task_queue_capacity);
+//    threadpool->task_queue_capacity = GGML_MAX_QUEUE_SIZE;
+//    threadpool->task_queue_size = 0;
+//    threadpool->task_queue = malloc(sizeof(struct worker_args*) * threadpool->task_queue_capacity);
 
     threadpool->tasks_in_flight = 0;
     ggml_cond_init(&threadpool->tasks_done_cond);
@@ -14960,8 +14943,14 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                     
                     ggml_mutex_lock(&threadpool->mutex);
                     for (int i = 0; i < task_count; i++) {
-                        threadpool->task_queue[threadpool->task_queue_size++] = task_list[i];
-                        threadpool->tasks_in_flight++;
+                        // If we have a warg for worker i:
+                        if (i < task_count) {
+                            threadpool->assigned_tasks[i] = task_list[i];
+                            threadpool->tasks_in_flight++;
+                        } else {
+                            // no task for this thread (NULL)
+                            threadpool->assigned_tasks[i] = NULL;
+                        }
                     }
                     ggml_cond_broadcast(&threadpool->cond);
                     ggml_mutex_unlock(&threadpool->mutex);
