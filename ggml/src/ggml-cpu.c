@@ -14689,6 +14689,13 @@ long get_memory_io_count(struct ggml_tensor * tensor) {
     return 0;
 }
 
+// TODO: Possible multithread synchorization bottleneck:
+//       1. [X not reason, as mulmat_with_two_threads also just use single thread to quant] Single threaded mulmat quantization F32->F16 / F32->Q8
+//       2. Main thread single conditional variable has delay        # os determined thread wakeup delay (can only avoid use cond)
+//       3. Worker thread contention on mutex on shared warg queue   # mutex lock (can be optimzied)
+//          Solution: Each worker thread create its own warg queue
+
+
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     const int n_nodes = cgraph->n_nodes;
     
