@@ -14728,8 +14728,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     };
     
 #define TOPO_EXECUTION
-//#define SIMPLE_TOPO
-#define BENCHMARK_MEMORY_BANDWIDTH
+//#define SIMPLE_TOPO   // serial execution
+//#define BENCHMARK_MEMORY_BANDWIDTH
 
 #ifndef TOPO_EXECUTION
     // ------- FOR LOOP ---------
@@ -14779,30 +14779,41 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
 #ifdef SIMPLE_TOPO
     while (!is_queue_empty(working_queue)) {
-        struct ggml_tensor * node = dequeue(working_queue);
-        
-        if (node->op == GGML_OP_MUL_MAT) {
+        const int queue_size = working_queue->size;
+        printf("-- Q:");
+        struct timespec q_start, q_end;
+        clock_gettime(CLOCK_MONOTONIC, &q_start);
+        for (int i = 0; i < queue_size; i++) {
+            struct ggml_tensor * node = dequeue(working_queue);
+            printf("[%s] ", node->name);
+            if (node->op == GGML_OP_MUL_MAT) {
 #ifdef BENCHMARK_MEMORY_BANDWIDTH
-            long total_bytes_io = get_memory_io_count(node);
-            struct timespec start, end;
-            clock_gettime(CLOCK_MONOTONIC, &start);
+                long total_bytes_io = get_memory_io_count(node);
+                struct timespec start, end;
+                clock_gettime(CLOCK_MONOTONIC, &start);
 #endif
-            mulmat_with_two_threads(node, cplan->work_size);
+                mulmat_with_two_threads(node, cplan->work_size);
+                
+#ifdef BENCHMARK_MEMORY_BANDWIDTH
+                clock_gettime(CLOCK_MONOTONIC, &end);
+                long seconds = end.tv_sec - start.tv_sec;
+                long nanoseconds = end.tv_nsec - start.tv_nsec;
+                double duration_us = seconds * 1e6 + nanoseconds / 1e3;
+                double duration_s = duration_us / 1e6; // Convert duration to seconds
+                double bandwidth = (double)total_bytes_io / duration_s / 1e9;
+                printf("->Two threads mulmat total time: %.2f us | total IO: %.4f MB | bandwidth: %.2f GB/s\n", duration_us, ((double)total_bytes_io / 1e6), bandwidth);
+#endif
+            } else {
+                ggml_compute_forward(&params, node);
+            }
             
-#ifdef BENCHMARK_MEMORY_BANDWIDTH
-            clock_gettime(CLOCK_MONOTONIC, &end);
-            long seconds = end.tv_sec - start.tv_sec;
-            long nanoseconds = end.tv_nsec - start.tv_nsec;
-            double duration_us = seconds * 1e6 + nanoseconds / 1e3;
-            double duration_s = duration_us / 1e6; // Convert duration to seconds
-            double bandwidth = (double)total_bytes_io / duration_s / 1e9;
-            printf("->Two threads mulmat total time: %.2f us | total IO: %.4f MB | bandwidth: %.2f GB/s\n", duration_us, ((double)total_bytes_io / 1e6), bandwidth);
-#endif
-        } else {
-            ggml_compute_forward(&params, node);
+            enqueue_child_node(cgraph, node, working_queue);
         }
-        
-        enqueue_child_node(cgraph, node, working_queue);
+        clock_gettime(CLOCK_MONOTONIC, &q_end);
+        long seconds = q_end.tv_sec - q_start.tv_sec;
+        long nanoseconds = q_end.tv_nsec - q_start.tv_nsec;
+        double duration_us = seconds * 1e6 + nanoseconds / 1e3;
+        printf("Time: %.1f us\n", duration_us);
     }
 #endif
 
@@ -14814,19 +14825,28 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
     while (!is_queue_empty(working_queue)) {
         const int queue_size = working_queue->size;
         
-//        printf("---- Q: ");
+        printf("-- Q: ");
         bool all_mulmat = true;
         struct ggml_queue_node * ptr = working_queue->front;
         for (int i = 0; i < queue_size; i++) {
-//            printf("[%s] (%p) ", ptr->tensor->name, ptr->tensor);
-            if (ptr->tensor->op != GGML_OP_MUL_MAT) { all_mulmat = false; break; }
+            printf("[%s] ", ptr->tensor->name);
+            if (ptr->tensor->op != GGML_OP_MUL_MAT) {
+                all_mulmat = false;
+            }
             ptr = ptr->next;
         }
-//        printf("\n");
+        //        printf("\n");
+        
+        struct timespec q_start, q_end;
+        clock_gettime(CLOCK_MONOTONIC, &q_start);
         
         if (queue_size == 1) {
             struct ggml_tensor * node = dequeue(working_queue);
-            ggml_compute_forward(&params, node);
+            if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL) {
+                mulmat_with_two_threads(node, cplan->work_size);
+            } else {
+                ggml_compute_forward(&params, node);
+            }
             enqueue_child_node(cgraph, node, working_queue);
         } else {
             if (all_mulmat) {
@@ -14842,10 +14862,10 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 atomic_int * n_barrier_passed_array[queue_size];
                 
                 int worker_idx = 0;
-
+                
                 long total_bytes_io = 0;
                 struct timespec start, end;
-
+                
                 {
                     // During node splitting:
                     for (int i = 0; i < NUM_WORKER_NODES; i++) {
@@ -14990,38 +15010,53 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 
                 free(task_list);
             } else {
-                // Do not run queue in multiple threads if they are not mulmat
-                const int num_workers = queue_size - 1;
-                pthread_t workers[num_workers];
-                struct ggml_tensor * worker_nodes[num_workers];
-                struct worker_args * worker_argments[num_workers];
-                
-                for (int i = 0; i < num_workers; i++) {
+//                // Do not run queue in multiple threads if they are not mulmat
+//                const int num_workers = queue_size - 1;
+//                pthread_t workers[num_workers];
+//                struct ggml_tensor * worker_nodes[num_workers];
+//                struct worker_args * worker_argments[num_workers];
+//                
+//                for (int i = 0; i < num_workers; i++) {
+//                    struct ggml_tensor * node = dequeue(working_queue);
+//                    worker_nodes[i] = node;
+//                    
+//                    struct worker_args * warg = malloc(sizeof(struct worker_args));
+//                    warg->ith = 0;
+//                    warg->nth = 1;
+//                    warg->tensor = node;
+//                    warg->wsize = cplan->work_size;
+//                    warg->wdata = NULL;   // worker threads will be responsible for malloc and free
+//                    worker_argments[i] = warg;
+//                    pthread_create(&workers[i], NULL, ggml_graph_compute_worker_thread, (void *)warg);
+//                }
+//                
+//                struct ggml_tensor * node = dequeue(working_queue);
+//                
+//                ggml_compute_forward(&params, node);
+//                enqueue_child_node(cgraph, node, working_queue);
+//                
+//                for (int i = 0; i < num_workers; i++) {
+//                    pthread_join(workers[i], NULL);
+//                    enqueue_child_node(cgraph, worker_nodes[i], working_queue);
+//                    free(worker_argments[i]);
+//                }
+                for (int i = 0; i < queue_size; i++) {
                     struct ggml_tensor * node = dequeue(working_queue);
-                    worker_nodes[i] = node;
-                    
-                    struct worker_args * warg = malloc(sizeof(struct worker_args));
-                    warg->ith = 0;
-                    warg->nth = 1;
-                    warg->tensor = node;
-                    warg->wsize = cplan->work_size;
-                    warg->wdata = NULL;   // worker threads will be responsible for malloc and free
-                    worker_argments[i] = warg;
-                    pthread_create(&workers[i], NULL, ggml_graph_compute_worker_thread, (void *)warg);
-                }
-                
-                struct ggml_tensor * node = dequeue(working_queue);
-                
-                ggml_compute_forward(&params, node);
-                enqueue_child_node(cgraph, node, working_queue);
-                
-                for (int i = 0; i < num_workers; i++) {
-                    pthread_join(workers[i], NULL);
-                    enqueue_child_node(cgraph, worker_nodes[i], working_queue);
-                    free(worker_argments[i]);
+                    if (node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL) {
+                        mulmat_with_two_threads(node, cplan->work_size);
+                    } else {
+                        ggml_compute_forward(&params, node);
+                    }
+                    enqueue_child_node(cgraph, node, working_queue);
                 }
             }
         }
+        
+        clock_gettime(CLOCK_MONOTONIC, &q_end);
+        long seconds = q_end.tv_sec - q_start.tv_sec;
+        long nanoseconds = q_end.tv_nsec - q_start.tv_nsec;
+        double duration_us = seconds * 1e6 + nanoseconds / 1e3;
+        printf("Time: %.1f us\n", duration_us);
     }
 #endif
     free(kq_mask_ptr);
