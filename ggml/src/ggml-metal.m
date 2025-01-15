@@ -3974,6 +3974,361 @@ static void ggml_backend_metal_set_n_cb(ggml_backend_t backend, int n_cb) {
     });
 }
 
+id<MTLBuffer> createMetalBufferFromTensor(id<MTLDevice> device, struct ggml_tensor * tensor) {
+    if (!device || !tensor || !tensor->data) {
+        NSLog(@"Invalid device or tensor.");
+        return nil;
+    }
+
+    // Create a Metal buffer using the tensor's data pointer
+    id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:tensor->data
+                                                     length:ggml_nbytes(tensor)
+                                                    options:MTLResourceStorageModeShared
+                                                deallocator:nil];
+
+    if (!buffer) {
+        NSLog(@"Failed to create Metal buffer from tensor data.");
+    } else {
+        NSLog(@"Successfully created Metal buffer from tensor data.");
+    }
+
+    return buffer;
+}
+
+static void add_mulmat_kernels(int index, char * name, bool supported, struct ggml_metal_kernel * kernels, id<MTLLibrary> metal_library, id<MTLDevice> device) {
+    if (supported) {
+        NSString *kernelFunctionName = [NSString stringWithFormat:@"kernel_%s", name];
+        
+        NSError * error = nil;
+        id<MTLFunction> metal_function = [metal_library newFunctionWithName:kernelFunctionName];
+        kernels[index].pipeline = [device newComputePipelineStateWithFunction:metal_function error:&error];
+        NSLog(@"%s: loaded kernel %@", __func__, kernelFunctionName);
+        [metal_function release];
+    } else {
+        NSLog(@"%s: skipping kernel_%-33s (not supported)\n", __func__, name);
+    }
+}
+
+const int KERNEL_IDX_OFFSET = 108;
+
+static void init_mulmat_kernels(id<MTLDevice> device, struct ggml_metal_kernel * kernels) {
+    id<MTLLibrary> metal_library;
+    // load library
+    //
+    // - first check if the library is embedded
+    // - then check if the library is in the bundle
+    // - if not found, load the source and compile it
+    // - if that fails, return NULL
+    {
+        NSBundle * bundle = nil;
+#ifdef SWIFT_PACKAGE
+        bundle = SWIFTPM_MODULE_BUNDLE;
+#else
+        bundle = [NSBundle bundleForClass:[GGMLMetalClass class]];
+#endif
+
+        NSError * error = nil;
+
+#if GGML_METAL_EMBED_LIBRARY
+        const bool try_metallib = false;
+#else
+        const bool try_metallib = true;
+#endif
+
+        NSString * path_lib = [bundle pathForResource:@"default" ofType:@"metallib"];
+        if (try_metallib && path_lib != nil) {
+            // pre-compiled library found
+            NSURL * libURL = [NSURL fileURLWithPath:path_lib];
+            GGML_LOG_INFO("%s: loading '%s'\n", __func__, [path_lib UTF8String]);
+
+            metal_library = [device newLibraryWithURL:libURL error:&error];
+            if (error) {
+                GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
+                return NULL;
+            }
+        } else {
+#if GGML_METAL_EMBED_LIBRARY
+            GGML_LOG_INFO("%s: using embedded metal library\n", __func__);
+
+            extern const char ggml_metallib_start[];
+            extern const char ggml_metallib_end[];
+
+            NSString * src = [[NSString alloc] initWithBytes:ggml_metallib_start length:(ggml_metallib_end-ggml_metallib_start) encoding:NSUTF8StringEncoding];
+#else
+            GGML_LOG_INFO("%s: default.metallib not found, loading from source\n", __func__);
+
+            NSString * path_source;
+            NSString * path_resource = [[NSProcessInfo processInfo].environment objectForKey:@"GGML_METAL_PATH_RESOURCES"];
+
+            GGML_LOG_INFO("%s: GGML_METAL_PATH_RESOURCES = %s\n", __func__, path_resource ? [path_resource UTF8String] : "nil");
+
+            if (path_resource) {
+                path_source = [path_resource stringByAppendingPathComponent:@"ggml-metal.metal"];
+            } else {
+                path_source = [bundle pathForResource:@"ggml-metal" ofType:@"metal"];
+            }
+
+            if (path_source == nil) {
+                GGML_LOG_WARN("%s: error: could not use bundle path to find ggml-metal.metal, falling back to trying cwd\n", __func__);
+                path_source = @"ggml-metal.metal";
+            }
+
+            GGML_LOG_INFO("%s: loading '%s'\n", __func__, [path_source UTF8String]);
+
+            NSString * src = [NSString stringWithContentsOfFile:path_source encoding:NSUTF8StringEncoding error:&error];
+            if (error) {
+                GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
+                return NULL;
+            }
+#endif // GGML_METAL_EMBED_LIBRARY
+
+            @autoreleasepool {
+                // dictionary of preprocessor macros
+                NSMutableDictionary * prep = [NSMutableDictionary dictionary];
+
+                MTLCompileOptions * options = [MTLCompileOptions new];
+                options.preprocessorMacros = prep;
+
+                //[options setFastMathEnabled:false];
+
+                metal_library = [device newLibraryWithSource:src options:options error:&error];
+                if (error) {
+                    GGML_LOG_ERROR("%s: error: %s\n", __func__, [[error description] UTF8String]);
+                    return NULL;
+                }
+
+#if !__has_feature(objc_arc)
+                [options release];
+#endif
+            }
+#if GGML_METAL_EMBED_LIBRARY
+            [src release];
+#endif // GGML_METAL_EMBED_LIBRARY
+        }
+    }
+    
+    const bool has_simdgroup_mm = true;
+    const bool use_bfloat = false;
+    
+    NSLog(@"GGML_METAL_KERNEL_TYPE_MUL_MM_F32_F32 idx: %d\n", GGML_METAL_KERNEL_TYPE_MUL_MM_F32_F32);
+    
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_F32_F32 - KERNEL_IDX_OFFSET, "mul_mm_f32_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_F16_F32 - KERNEL_IDX_OFFSET, "mul_mm_f16_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_BF16_F32 - KERNEL_IDX_OFFSET, "mul_mm_bf16_f32", has_simdgroup_mm && use_bfloat, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_Q4_0_F32 - KERNEL_IDX_OFFSET, "mul_mm_q4_0_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_Q4_1_F32 - KERNEL_IDX_OFFSET, "mul_mm_q4_1_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_Q5_0_F32 - KERNEL_IDX_OFFSET, "mul_mm_q5_0_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_Q5_1_F32 - KERNEL_IDX_OFFSET, "mul_mm_q5_1_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_Q8_0_F32 - KERNEL_IDX_OFFSET, "mul_mm_q8_0_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_Q2_K_F32 - KERNEL_IDX_OFFSET, "mul_mm_q2_K_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_Q3_K_F32 - KERNEL_IDX_OFFSET, "mul_mm_q3_K_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_Q4_K_F32 - KERNEL_IDX_OFFSET, "mul_mm_q4_K_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_Q5_K_F32 - KERNEL_IDX_OFFSET, "mul_mm_q5_K_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_Q6_K_F32 - KERNEL_IDX_OFFSET, "mul_mm_q6_K_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ2_XXS_F32 - KERNEL_IDX_OFFSET, "mul_mm_iq2_xxs_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ2_XS_F32 - KERNEL_IDX_OFFSET, "mul_mm_iq2_xs_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ3_XXS_F32 - KERNEL_IDX_OFFSET, "mul_mm_iq3_xxs_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ3_S_F32 - KERNEL_IDX_OFFSET, "mul_mm_iq3_s_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ2_S_F32 - KERNEL_IDX_OFFSET, "mul_mm_iq2_s_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ1_S_F32 - KERNEL_IDX_OFFSET, "mul_mm_iq1_s_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ1_M_F32 - KERNEL_IDX_OFFSET, "mul_mm_iq1_m_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ4_NL_F32 - KERNEL_IDX_OFFSET, "mul_mm_iq4_nl_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_IQ4_XS_F32 - KERNEL_IDX_OFFSET, "mul_mm_iq4_xs_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_F32_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_f32_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_F16_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_f16_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_BF16_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_bf16_f32", has_simdgroup_mm && use_bfloat, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q4_0_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_q4_0_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q4_1_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_q4_1_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q5_0_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_q5_0_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q5_1_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_q5_1_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q8_0_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_q8_0_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q2_K_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_q2_K_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q3_K_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_q3_K_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q4_K_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_q4_K_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q5_K_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_q5_K_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_Q6_K_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_q6_K_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ2_XXS_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_iq2_xxs_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ2_XS_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_iq2_xs_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ3_XXS_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_iq3_xxs_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ3_S_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_iq3_s_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ2_S_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_iq2_s_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ1_S_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_iq1_s_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ1_M_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_iq1_m_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ4_NL_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_iq4_nl_f32", has_simdgroup_mm, kernels, metal_library, device);
+    add_mulmat_kernels(GGML_METAL_KERNEL_TYPE_MUL_MM_ID_IQ4_XS_F32 - KERNEL_IDX_OFFSET, "mul_mm_id_iq4_xs_f32", has_simdgroup_mm, kernels, metal_library, device);
+
+}
+
+static void encode_node(id<MTLDevice> device, struct ggml_tensor * node, id<MTLComputeCommandEncoder> encoder, struct ggml_metal_kernel * kernels) {
+    struct ggml_tensor * src0 = node->src[0];
+    struct ggml_tensor * src1 = node->src[1];
+    struct ggml_tensor * dst  = node;
+    
+    const int64_t  ne00 = src0 ? src0->ne[0] : 0;
+    const int64_t  ne01 = src0 ? src0->ne[1] : 0;
+    const int64_t  ne02 = src0 ? src0->ne[2] : 0;
+    const int64_t  ne03 = src0 ? src0->ne[3] : 0;
+
+    const uint64_t nb00 = src0 ? src0->nb[0] : 0;
+    const uint64_t nb01 = src0 ? src0->nb[1] : 0;
+    const uint64_t nb02 = src0 ? src0->nb[2] : 0;
+    const uint64_t nb03 = src0 ? src0->nb[3] : 0;
+
+    const int64_t  ne10 = src1 ? src1->ne[0] : 0;
+    const int64_t  ne11 = src1 ? src1->ne[1] : 0;
+    const int64_t  ne12 = src1 ? src1->ne[2] : 0;
+    const int64_t  ne13 = src1 ? src1->ne[3] : 0;
+
+    const uint64_t nb10 = src1 ? src1->nb[0] : 0;
+    const uint64_t nb11 = src1 ? src1->nb[1] : 0;
+    const uint64_t nb12 = src1 ? src1->nb[2] : 0;
+    const uint64_t nb13 = src1 ? src1->nb[3] : 0;
+
+    const int64_t  ne0  =  dst ?  dst->ne[0] : 0;
+    const int64_t  ne1  =  dst ?  dst->ne[1] : 0;
+    const int64_t  ne2  =  dst ?  dst->ne[2] : 0;
+    const int64_t  ne3  =  dst ?  dst->ne[3] : 0;
+
+    const uint64_t nb0  =  dst ?  dst->nb[0] : 0;
+    const uint64_t nb1  =  dst ?  dst->nb[1] : 0;
+    const uint64_t nb2  =  dst ?  dst->nb[2] : 0;
+    const uint64_t nb3  =  dst ?  dst->nb[3] : 0;
+
+    const enum ggml_type src0t = src0 ? src0->type : GGML_TYPE_COUNT;
+    const enum ggml_type src1t = src1 ? src1->type : GGML_TYPE_COUNT;
+    const enum ggml_type dstt  = dst  ? dst->type  : GGML_TYPE_COUNT;
+
+    size_t offs_src0 = 0;
+    size_t offs_src1 = 0;
+    size_t offs_dst  = 0;
+
+    id<MTLBuffer> id_src0 = createMetalBufferFromTensor(device, src0);
+    id<MTLBuffer> id_src1 = createMetalBufferFromTensor(device, src1);
+    id<MTLBuffer> id_dst = createMetalBufferFromTensor(device, dst);
+        
+    GGML_ASSERT(ne00 == ne10);   // has to be mulmat
+
+    GGML_ASSERT(ne12 % ne02 == 0);
+    GGML_ASSERT(ne13 % ne03 == 0);
+
+    const uint r2 = ne12/ne02;
+    const uint r3 = ne13/ne03;
+
+    // find the break-even point where the matrix-matrix kernel becomes more efficient compared
+    // to the matrix-vector kernel
+    int ne11_mm_min = 1;
+    
+    //printf("matrix: ne00 = %6d, ne01 = %6d, ne02 = %6d, ne11 = %6d, ne12 = %6d\n", ne00, ne01, ne02, ne11, ne12);
+    
+    // some Metal matrix data types require aligned pointers
+    // ref: https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf (Table 2.5)
+    switch (src0->type) {
+        case GGML_TYPE_F32:  GGML_ASSERT(nb01 % 16 == 0); break;
+        case GGML_TYPE_F16:  GGML_ASSERT(nb01 % 8  == 0); break;
+        case GGML_TYPE_BF16: GGML_ASSERT(nb01 % 8  == 0); break;
+        default: break;
+    }
+    
+    id<MTLComputePipelineState> pipeline = nil;
+    
+    switch (src0->type) {
+        case GGML_TYPE_F32:     pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_F32_F32     - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_F16:     pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_F16_F32     - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_BF16:    pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_BF16_F32    - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_Q4_0:    pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_Q4_0_F32    - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_Q4_1:    pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_Q4_1_F32    - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_Q5_0:    pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_Q5_0_F32    - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_Q5_1:    pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_Q5_1_F32    - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_Q8_0:    pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_Q8_0_F32    - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_Q2_K:    pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_Q2_K_F32    - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_Q3_K:    pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_Q3_K_F32    - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_Q4_K:    pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_Q4_K_F32    - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_Q5_K:    pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_Q5_K_F32    - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_Q6_K:    pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_Q6_K_F32    - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_IQ2_XXS: pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_IQ2_XXS_F32 - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_IQ2_XS:  pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_IQ2_XS_F32  - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_IQ3_XXS: pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_IQ3_XXS_F32 - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_IQ3_S:   pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_IQ3_S_F32   - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_IQ2_S:   pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_IQ2_S_F32   - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_IQ1_S:   pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_IQ1_S_F32   - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_IQ1_M:   pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_IQ1_M_F32   - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_IQ4_NL:  pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_IQ4_NL_F32  - KERNEL_IDX_OFFSET].pipeline; break;
+        case GGML_TYPE_IQ4_XS:  pipeline = kernels[GGML_METAL_KERNEL_TYPE_MUL_MM_IQ4_XS_F32  - KERNEL_IDX_OFFSET].pipeline; break;
+        default: GGML_ABORT("MUL MAT-MAT not implemented");
+    }
+    
+    [encoder setComputePipelineState:pipeline];
+    [encoder setBuffer:id_src0 offset:offs_src0    atIndex:0];
+    [encoder setBuffer:id_src1 offset:offs_src1    atIndex:1];
+    [encoder setBuffer:id_dst  offset:offs_dst     atIndex:2];
+    [encoder setBytes:&ne00    length:sizeof(ne00) atIndex:3];
+    [encoder setBytes:&ne02    length:sizeof(ne02) atIndex:4];
+    [encoder setBytes:&nb01    length:sizeof(nb01) atIndex:5];
+    [encoder setBytes:&nb02    length:sizeof(nb02) atIndex:6];
+    [encoder setBytes:&nb03    length:sizeof(nb03) atIndex:7];
+    [encoder setBytes:&ne12    length:sizeof(ne12) atIndex:8];
+    [encoder setBytes:&nb10    length:sizeof(nb10) atIndex:9];
+    [encoder setBytes:&nb11    length:sizeof(nb11) atIndex:10];
+    [encoder setBytes:&nb12    length:sizeof(nb12) atIndex:11];
+    [encoder setBytes:&nb13    length:sizeof(nb13) atIndex:12];
+    [encoder setBytes:&ne0     length:sizeof(ne0)  atIndex:13];
+    [encoder setBytes:&ne1     length:sizeof(ne1)  atIndex:14];
+    [encoder setBytes:&r2      length:sizeof(r2)   atIndex:15];
+    [encoder setBytes:&r3      length:sizeof(r3)   atIndex:16];
+    [encoder setThreadgroupMemoryLength:8192 atIndex:0];
+    [encoder dispatchThreadgroups:MTLSizeMake( (ne11 + 31)/32, (ne01 + 63)/64, ne12*ne13) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+}
+
+struct ggml_metal_kernel mulmat_kernels[44]; // 44 mulmat kernels in total
+
+void mulmat_with_gpu(struct ggml_tensor * node, const size_t work_size) {
+    // Step 1: Initialize the Metal device
+    id<MTLDevice> metalDevice = MTLCreateSystemDefaultDevice();
+    if (!metalDevice) {
+        NSLog(@"Metal is not supported on this device.");
+        return;
+    }
+    NSLog(@"Metal device initialized: %@", metalDevice.name);
+    
+    // Step 2: Create a command queue
+    id<MTLCommandQueue> commandQueue = [metalDevice newCommandQueue];
+    if (!commandQueue) {
+        NSLog(@"Failed to create Metal command queue.");
+        return;
+    }
+    
+    if (mulmat_kernels[0].pipeline == NULL) {
+        init_mulmat_kernels(metalDevice, mulmat_kernels);
+    }
+    
+    // Step 3: Create a command buffer
+    id<MTLCommandBuffer> commandBuffer = [commandQueue commandBuffer];
+    if (!commandBuffer) {
+        NSLog(@"Failed to create command buffer.");
+        return;
+    }
+    
+    // Step 4: Create a command encoder
+    id<MTLComputeCommandEncoder> commandEncoder = [commandBuffer computeCommandEncoder];
+    if (!commandEncoder) {
+        NSLog(@"Failed to create command encoder.");
+        return;
+    }
+
+    encode_node(metalDevice, node, commandEncoder, mulmat_kernels);
+    
+    // End encoding
+    [commandEncoder endEncoding];
+    
+    // Step 5: Commit the command buffer
+    [commandBuffer commit];
+    
+    // Optional: Wait for the command buffer to complete execution
+    [commandBuffer waitUntilCompleted];
+    
+    NSLog(@"Command buffer committed and executed.");
+}
+
 static struct ggml_backend_i ggml_backend_metal_i = {
     /* .get_name                = */ ggml_backend_metal_name,
     /* .free                    = */ ggml_backend_metal_free,

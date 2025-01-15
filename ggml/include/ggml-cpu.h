@@ -141,6 +141,8 @@ extern "C" {
 
     GGML_API ggml_backend_reg_t ggml_backend_cpu_reg(void);
 
+    GGML_API void mulmat_with_gpu(struct ggml_tensor * node, const size_t work_size);
+
 #ifdef GGML_USE_CPU_HBM
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_hbm_buffer_type(void);
 #endif

@@ -14727,7 +14727,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         .wargs = NULL,
     };
     
-#define TOPO_EXECUTION
+//#define TOPO_EXECUTION
 //#define SIMPLE_TOPO   // serial execution
 //#define BENCHMARK_MEMORY_BANDWIDTH
 
@@ -14737,7 +14737,9 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 //        printf("----F Node [%s] (%p) \"%s\"\n", cgraph->nodes[i]->name, cgraph->nodes[i], ggml_op_name(cgraph->nodes[i]->op));
         
         if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
-            mulmat_with_two_threads(cgraph->nodes[i], cplan->work_size);
+            mulmat_with_gpu(cgraph->nodes[i], cplan->work_size);
+
+//            mulmat_with_two_threads(cgraph->nodes[i], cplan->work_size);
         } else {
             ggml_compute_forward(&params, cgraph->nodes[i]);
         }
