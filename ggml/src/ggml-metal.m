@@ -4279,23 +4279,39 @@ static void encode_node(id<MTLDevice> device, struct ggml_tensor * node, id<MTLC
     [encoder dispatchThreadgroups:MTLSizeMake( (ne11 + 31)/32, (ne01 + 63)/64, ne12*ne13) threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
 }
 
+static id<MTLDevice> sharedMetalDevice = nil;
+
+id<MTLDevice> getSharedMetalDevice() {
+    if (!sharedMetalDevice) {
+        sharedMetalDevice = MTLCreateSystemDefaultDevice();
+        if (!sharedMetalDevice) {
+            NSLog(@"Metal is not supported on this device.");
+        }
+        NSLog(@"Metal device initialized: %@", sharedMetalDevice.name);
+    }
+    return sharedMetalDevice;
+}
+
+static id<MTLCommandQueue> sharedCommandQueue = nil;
+
+id<MTLCommandQueue> getSharedCommandQueue(id<MTLDevice> device) {
+    if (!sharedCommandQueue) {
+        sharedCommandQueue = [device newCommandQueue];
+        if (!sharedCommandQueue) {
+            NSLog(@"Failed to create Metal command queue.");
+        }
+    }
+    return sharedCommandQueue;
+}
+
 struct ggml_metal_kernel mulmat_kernels[44]; // 44 mulmat kernels in total
 
 void mulmat_with_gpu(struct ggml_tensor * node, const size_t work_size) {
-    // Step 1: Initialize the Metal device
-    id<MTLDevice> metalDevice = MTLCreateSystemDefaultDevice();
-    if (!metalDevice) {
-        NSLog(@"Metal is not supported on this device.");
-        return;
-    }
-    NSLog(@"Metal device initialized: %@", metalDevice.name);
+    id<MTLDevice> metalDevice = getSharedMetalDevice();  // reuse same metal device
+    if (!metalDevice) return;
     
-    // Step 2: Create a command queue
-    id<MTLCommandQueue> commandQueue = [metalDevice newCommandQueue];
-    if (!commandQueue) {
-        NSLog(@"Failed to create Metal command queue.");
-        return;
-    }
+    id<MTLCommandQueue> commandQueue = getSharedCommandQueue(metalDevice);  // reuse same command queue
+    if (!commandQueue) return;
     
     if (mulmat_kernels[0].pipeline == NULL) {
         init_mulmat_kernels(metalDevice, mulmat_kernels);
@@ -4317,13 +4333,10 @@ void mulmat_with_gpu(struct ggml_tensor * node, const size_t work_size) {
 
     encode_node(metalDevice, node, commandEncoder, mulmat_kernels);
     
-    // End encoding
     [commandEncoder endEncoding];
     
-    // Step 5: Commit the command buffer
     [commandBuffer commit];
     
-    // Optional: Wait for the command buffer to complete execution
     [commandBuffer waitUntilCompleted];
     
     NSLog(@"Command buffer committed and executed.");
