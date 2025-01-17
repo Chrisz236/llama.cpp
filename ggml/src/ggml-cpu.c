@@ -12761,6 +12761,13 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
 
 // -------- CHRIS WRAPPER API FOR GGML_COMPUTE_FORWARD --------
 
+static thread_ret_t ggml_mulmat_gpu_worker(void * data) {
+    struct worker_args * worker_args = (struct worker_args *) data;
+    struct ggml_tensor * tensor = worker_args->tensor;
+    mulmat_with_gpu(tensor, worker_args->wsize);
+    return NULL;
+}
+
 // Another half will be executed via this worker
 static thread_ret_t ggml_mulmat_worker(void * data) {
     struct worker_args * worker_args = (struct worker_args *) data;
@@ -14672,13 +14679,6 @@ long get_memory_io_count(struct ggml_tensor * tensor) {
     return 0;
 }
 
-// TODO: Possible multithread synchorization bottleneck:
-//       1. [X not reason, as mulmat_with_two_threads also just use single thread to quant] Single threaded mulmat quantization F32->F16 / F32->Q8
-//       2. Main thread single conditional variable has delay        # os determined thread wakeup delay (can only avoid use cond)
-//       3. Worker thread contention on mutex on shared warg queue   # mutex lock (can be optimzied)
-//          Solution: Each worker thread create its own warg queue
-
-
 enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan) {
     const int n_nodes = cgraph->n_nodes;
     
@@ -14727,7 +14727,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         .wargs = NULL,
     };
     
-//#define TOPO_EXECUTION
+#define TOPO_EXECUTION
 //#define SIMPLE_TOPO   // serial execution
 //#define BENCHMARK_MEMORY_BANDWIDTH
 
@@ -14737,9 +14737,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 //        printf("----F Node [%s] (%p) \"%s\"\n", cgraph->nodes[i]->name, cgraph->nodes[i], ggml_op_name(cgraph->nodes[i]->op));
         
         if (cgraph->nodes[i]->op == GGML_OP_MUL_MAT) {
-            mulmat_with_gpu(cgraph->nodes[i], cplan->work_size);
-
-//            mulmat_with_two_threads(cgraph->nodes[i], cplan->work_size);
+//            mulmat_with_gpu(cgraph->nodes[i], cplan->work_size);
+            mulmat_with_two_threads(cgraph->nodes[i], cplan->work_size);
         } else {
             ggml_compute_forward(&params, cgraph->nodes[i]);
         }
@@ -14820,8 +14819,8 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 #endif
 
 #ifndef SIMPLE_TOPO
-    struct ggml_threadpool_params tp_params = ggml_threadpool_params_default(5);
-    struct ggml_threadpool * threadpool = ggml_threadpool_5_workers(&tp_params, cgraph, cplan);  // spawn 5 workers threads here
+//    struct ggml_threadpool_params tp_params = ggml_threadpool_params_default(5);
+//    struct ggml_threadpool * threadpool = ggml_threadpool_5_workers(&tp_params, cgraph, cplan);  // spawn 5 workers threads here
     
     // Topo execution
     while (!is_queue_empty(working_queue)) {
@@ -14837,7 +14836,7 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             }
             ptr = ptr->next;
         }
-        //        printf("\n");
+        printf("\n");
         
         struct timespec q_start, q_end;
         clock_gettime(CLOCK_MONOTONIC, &q_start);
@@ -14852,165 +14851,95 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
             enqueue_child_node(cgraph, node, working_queue);
         } else {
             if (all_mulmat) {
-                const int NUM_WORKER_NODES = queue_size - 1;
+                const int num_cpu_workers = (queue_size - 1) * 2 - 1;  // 3 nodes -> G/C/C -> 1 gpu_worker/2 cpu_worker/1 cpu_worker + 1 main thread
+                pthread_t cpu_workers[num_cpu_workers];
+                pthread_t gpu_worker;
                 
-                struct worker_args ** task_list = malloc(sizeof(struct worker_args*) * (NUM_WORKER_NODES * 2 + 1));
-                int task_count = 0;
+                struct ggml_tensor * worker_nodes[queue_size];         // CPU and GPU nodes together
                 
-                void * wdata_ptrs[queue_size];
-                struct ggml_tensor * nodes[queue_size];
-                struct worker_args * worker_argments[NUM_WORKER_NODES * 2 + 1];
-                atomic_int * current_chunk_array[queue_size];
-                atomic_int * n_barrier_passed_array[queue_size];
+                struct worker_args * cpu_worker_argments[num_cpu_workers];   // one worker, one argument
+                struct worker_args * gpu_worker_argument;                    // GPU worker's arugment
                 
-                int worker_idx = 0;
+                void * cpu_wdata_ptrs[queue_size - 1];                       // two CPU workers (each one node) share one wdata ptr
                 
-                long total_bytes_io = 0;
-                struct timespec start, end;
+                struct ggml_threadpool * temp_pools[queue_size - 1];   // pools only for CPU workers, GPU worker does not need
                 
-                {
-                    // During node splitting:
-                    for (int i = 0; i < NUM_WORKER_NODES; i++) {
-                        struct ggml_tensor * node = dequeue(working_queue);
-                        nodes[i] = node;
-                        
-                        long io_bytes = get_memory_io_count(node);
-                        total_bytes_io += io_bytes;
-                        
-                        void * wdata = malloc(cplan->work_size);
-                        wdata_ptrs[i] = wdata;
-                        
-                        atomic_int * current_chunk = malloc(sizeof(atomic_int));
-                        atomic_init(current_chunk, 2);
-                        current_chunk_array[i] = current_chunk;
-
-                        atomic_int * n_barrier_passed = malloc(sizeof(atomic_int));
-                        atomic_init(n_barrier_passed, 0);
-                        n_barrier_passed_array[i] = n_barrier_passed;
-                        
-                        struct worker_args * warg0 = malloc(sizeof(struct worker_args));
-                        warg0->ith = 0;
-                        warg0->nth = 2;
-                        warg0->tensor = node;
-                        warg0->tp = threadpool;
-                        warg0->wdata = wdata;
-                        warg0->wsize = cplan->work_size;
-                        warg0->current_chunk = current_chunk;
-                        warg0->n_barrier_passed = n_barrier_passed;
-                        worker_argments[worker_idx++] = warg0;
-                        
-                        struct worker_args * warg1 = malloc(sizeof(struct worker_args));
-                        warg1->ith = 1;
-                        warg1->nth = 2;
-                        warg1->tensor = node;
-                        warg1->tp = threadpool;
-                        warg1->wdata = wdata;
-                        warg1->wsize = cplan->work_size;
-                        warg1->current_chunk = current_chunk;
-                        warg1->n_barrier_passed = n_barrier_passed;
-                        worker_argments[worker_idx++] = warg1;
-                        
-                        task_list[task_count++] = warg0;
-                        task_list[task_count++] = warg1;
+                int worker_idx = 0;  // worker index counter for CPU workers
+                
+                struct ggml_tensor * heaviest_mulmat = NULL;
+                long heaviest_mulmat_bytes = 0;
+                
+                // Scan for heaviest matrix multiplcation node in queue
+                for (int i = 0; i < queue_size; i++) {
+                    struct ggml_tensor * node = dequeue(working_queue);
+                    worker_nodes[i] = node;
+                    
+                    long node_io_count = get_memory_io_count(node);
+                    if (node_io_count > heaviest_mulmat_bytes) {
+                        heaviest_mulmat = node;
+                        heaviest_mulmat_bytes = node_io_count;
                     }
                 }
                 
+                // Assign heaviest mulmat to GPU worker
                 {
-                    struct ggml_tensor * node = dequeue(working_queue);
-                    nodes[NUM_WORKER_NODES] = node;
-                    
-                    long io_bytes = get_memory_io_count(node);
-                    total_bytes_io += io_bytes;
-                    
-                    void * wdata = malloc(cplan->work_size);
-                    wdata_ptrs[NUM_WORKER_NODES] = wdata;
-                    
-                    atomic_int * current_chunk = malloc(sizeof(atomic_int));
-                    atomic_init(current_chunk, 2);
-                    current_chunk_array[NUM_WORKER_NODES] = current_chunk;
-
-                    atomic_int * n_barrier_passed = malloc(sizeof(atomic_int));
-                    atomic_init(n_barrier_passed, 0);
-                    n_barrier_passed_array[NUM_WORKER_NODES] = n_barrier_passed;
-                    
-                    struct worker_args * warg0 = malloc(sizeof(struct worker_args));
-                    warg0->ith = 0;
-                    warg0->nth = 2;
-                    warg0->tensor = node;
-                    warg0->tp = threadpool;
-                    warg0->wdata = wdata;
-                    warg0->wsize = cplan->work_size;
-                    warg0->current_chunk = current_chunk;
-                    warg0->n_barrier_passed = n_barrier_passed;
-                    worker_argments[worker_idx++] = warg0;
-                    
-                    task_list[task_count++] = warg0;
-                    
-                    // Just use warg to store `current_chunk` and `n_barrier_passed` to sync
-                    struct worker_args * warg1 = malloc(sizeof(struct worker_args));
-                    warg1->ith = 1;
-                    warg1->nth = 2;
-                    warg1->tensor = node;
-                    warg1->current_chunk = current_chunk;
-                    warg1->n_barrier_passed = n_barrier_passed;
-                    
-                    struct ggml_compute_params params_main = {
-                        .ith = warg1->ith,
-                        .nth = warg1->nth,
-                        .wsize = cplan->work_size,
-                        .wdata = wdata,
-                        .threadpool = threadpool,
-                        .wargs = warg1,
-                    };
-                    
-                    ggml_mutex_lock(&threadpool->mutex);
-                    for (int i = 0; i < task_count; i++) {
-                        // If we have a warg for worker i:
-                        if (i < task_count) {
-                            threadpool->assigned_tasks[i] = task_list[i];
-                            threadpool->tasks_in_flight++;
-                        } else {
-                            // no task for this thread (NULL)
-                            threadpool->assigned_tasks[i] = NULL;
+                    printf("[%s] assigned to GPU\n", heaviest_mulmat->name);
+                    struct worker_args * g_warg = malloc(sizeof(struct worker_args));
+                    g_warg->ith = 0;
+                    g_warg->nth = 1;
+                    g_warg->tensor = heaviest_mulmat;
+                    g_warg->wsize = cplan->work_size;
+                    g_warg->wdata = NULL;
+                    gpu_worker_argument = g_warg;
+                    pthread_create(&gpu_worker, NULL, ggml_mulmat_gpu_worker, (void *)g_warg);
+                }
+                
+                int node_idx = 0;
+                // Worker + Worker
+                {
+                    for (int i = 0; i < queue_size; i++) {
+                        struct ggml_tensor * node = worker_nodes[i];
+                        if (node != heaviest_mulmat) {
+                            struct ggml_threadpool * threadpool = malloc(sizeof(struct ggml_threadpool));
+                            atomic_store(&threadpool->current_chunk, 2);
+                            atomic_store(&threadpool->n_barrier_passed, 0);
+                            
+                            void * wdata = malloc(cplan->work_size);
+                            cpu_wdata_ptrs[node_idx] = wdata;
+                            temp_pools[node_idx] = threadpool;
+                            node_idx++;
+                            
+                            // worker 0, 1 belongs to same threadpool/node
+                            // worker 2, 3 belongs to same threadpool/node
+                            for (int w = 0; w < 2; w++) {
+                                struct worker_args * warg = malloc(sizeof(struct worker_args));
+                                warg->ith = w;
+                                warg->nth = 2;
+                                warg->tensor = node;
+                                warg->tp = threadpool;
+                                warg->wdata = wdata;
+                                warg->wsize = cplan->work_size;
+                                cpu_worker_argments[worker_idx] = warg;
+                                pthread_create(&cpu_workers[worker_idx], NULL, ggml_mulmat_worker, (void *)warg);
+                                worker_idx++;
+                            }
                         }
                     }
-                    ggml_cond_broadcast(&threadpool->cond);
-                    ggml_mutex_unlock(&threadpool->mutex);
-                    
-                    clock_gettime(CLOCK_MONOTONIC, &start);
-                    
-//                    printf("\t- main get [%s], ith = 1, nth = 2\n", node->name);
-                    ggml_compute_forward(&params_main, node);
-//                    printf("\t- main finished [%s], ith = 1, nth = 2\n", node->name);
-                    
-                    free(warg1);
                 }
-                
-                threadpool_wait_all(threadpool);
-                
-                clock_gettime(CLOCK_MONOTONIC, &end);
 
-#ifdef BENCHMARK_MEMORY_BANDWIDTH
-                long seconds = end.tv_sec - start.tv_sec;
-                long nanoseconds = end.tv_nsec - start.tv_nsec;
-                double duration_us = seconds * 1e6 + nanoseconds / 1e3;
-                double duration_s = duration_us / 1e6; // Convert duration to seconds
-                double bandwidth = (double)total_bytes_io / duration_s / 1e9;
-                printf("->Threadpool total time: %.2f us | total IO: %.4f MB | bandwidth: %.2f GB/s\n", duration_us, ((double)total_bytes_io / 1e6), bandwidth);
-#endif
+                pthread_join(gpu_worker, NULL);
                 
-                for (int i = 0; i < NUM_WORKER_NODES * 2 + 1; i++) {
-                    free(worker_argments[i]);
+                for (int i = 0; i < num_cpu_workers; i++) {
+                    pthread_join(cpu_workers[i], NULL);
+                }
+                                
+                for (int i = 0; i < queue_size - 1; i++) {
+                    enqueue_child_node(cgraph, worker_nodes[i], working_queue);
+                    free(cpu_wdata_ptrs[i]);
+                    free(temp_pools[i]);
                 }
                 
-                for (int i = 0; i < queue_size; i++) {
-                    enqueue_child_node(cgraph, nodes[i], working_queue);
-                    free(wdata_ptrs[i]);
-                    free(current_chunk_array[i]);
-                    free(n_barrier_passed_array[i]);
-                }
-                
-                free(task_list);
+                enqueue_child_node(cgraph, worker_nodes[queue_size - 1], working_queue);
             } else {
 //                // Do not run queue in multiple threads if they are not mulmat
 //                const int num_workers = queue_size - 1;

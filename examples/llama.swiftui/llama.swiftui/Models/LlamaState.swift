@@ -106,6 +106,12 @@ class LlamaState: ObservableObject {
             url: "https://huggingface.co/ggml-org/models/resolve/main/phi-2/ggml-model-q8_0.gguf?download=true",
             filename: "phi-2-q8_0.gguf", status: "download"
         ),
+        
+        Model(
+            name: "Phi-2.7B (F16, 5.5 GiB)",
+            url: "https://huggingface.co/prince-canuma/Damysus-2.7B-Chat-GGUF/resolve/main/Damysus-2.7B-Chat.f16.gguf?download=true",
+            filename: "phi-2-f16.gguf", status: "download"
+        ),
 
         Model(
             name: "Mistral-7B-v0.1 (Q4_0, 3.8 GiB)",
