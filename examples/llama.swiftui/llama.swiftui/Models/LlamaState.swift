@@ -208,17 +208,19 @@ class LlamaState: ObservableObject {
 
         messageLog += "\(text)"
 
-        // Instead of launching a Task, await completion directly
-        while await !llamaContext.is_done {
+        var tokenCount = 0
+        while await !llamaContext.is_done && tokenCount < 128 {
             let result = await llamaContext.completion_loop()
             await MainActor.run {
                 self.messageLog += "\(result)"
             }
+            tokenCount += 1
         }
 
         let t_end = DispatchTime.now().uptimeNanoseconds
         let t_generation = Double(t_end - t_heat_end) / self.NS_PER_S
-        let tokens_per_second = Double(await llamaContext.n_len) / t_generation
+//        let tokens_per_second = Double(await llamaContext.n_len) / t_generation
+        let tokens_per_second = Double(tokenCount) / t_generation
 
         await llamaContext.clear()
 
