@@ -67,8 +67,6 @@ struct ContentView: View {
         for i in current..<end {
             await benchmark_dataset(datasetName: dataset, questionID: i)
             await upload_results(output: llamaState.messageLog, dataset_name: dataset, question_id: i)
-            
-            sleep(2)
             clear()
             let fileURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("llama3.2-1B-chat-f16.gguf") // manually reload model file everytime finished
             do {
