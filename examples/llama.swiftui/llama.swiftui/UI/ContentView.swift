@@ -1,5 +1,8 @@
 import SwiftUI
 
+var dataset_name: String = ""
+var question_id = -1
+
 struct ContentView: View {
     @StateObject var llamaState = LlamaState()
     @State private var multiLineText = ""
@@ -29,7 +32,10 @@ struct ContentView: View {
                     }
 
                     Button("Bench") {
-                        bench()
+//                        bench()
+                        Task {
+                            await updateBenchmarkParameters(dataset: "mmlu", current: 1, end: 10000)
+                        }
                     }
 
                     Button("Clear") {
@@ -54,7 +60,55 @@ struct ContentView: View {
 
         }
     }
-
+    
+    func updateBenchmarkParameters(dataset: String, current: Int, end: Int) async {
+        dataset_name = dataset
+        question_id = current
+        for i in current..<end {
+            await benchmark_dataset(datasetName: dataset, questionID: i)
+            await upload_results(output: llamaState.messageLog, dataset_name: dataset, question_id: i)
+            clear()
+            let fileURL = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].appendingPathComponent("llama3.2-1B-chat-f16.gguf") // manually reload model file everytime finished
+            do {
+                try llamaState.loadModel(modelUrl: fileURL)
+            } catch let err {
+                print("Error: \(err.localizedDescription)")
+            }
+        }
+    }
+    
+    func benchmark_dataset(datasetName: String, questionID: Int) async {
+        let serverURL = "http://\(server_ip):\(server_port)/get_question"
+        
+        let urlString = "\(serverURL)?dataset=\(datasetName)&question_id=\(questionID)"
+        
+        guard let url = URL(string: urlString) else {
+            print("Invalid URL: \(urlString)")
+            return
+        }
+        
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            
+            guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+                print("Failed to fetch question for dataset \(datasetName), question \(questionID)")
+                return
+            }
+            
+            if let jsonResponse = try JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+               let formatted_prompt = jsonResponse["formatted_prompt"] as? String {
+                //                print(formatted_prompt)
+                await llamaState.complete_bench(text: formatted_prompt)
+                multiLineText = ""
+            }
+        } catch {
+            print("Error fetching or parsing question for dataset \(datasetName), question \(questionID): \(error.localizedDescription)")
+        }
+    }
+    
     func sendText() {
         Task {
             await llamaState.complete(text: "The meaning of the life is")

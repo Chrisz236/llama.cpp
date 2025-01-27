@@ -8,6 +8,9 @@ struct Model: Identifiable {
     var status: String?
 }
 
+let server_ip = "192.168.4.112"
+let server_port = "5008"
+
 @MainActor
 class LlamaState: ObservableObject {
     @Published var messageLog = ""
@@ -173,7 +176,45 @@ class LlamaState: ObservableObject {
             }
         }
     }
-
+    
+    func complete_bench(text: String) async {
+        guard let llamaContext else {
+            return
+        }
+        
+        let t_start = DispatchTime.now().uptimeNanoseconds
+        await llamaContext.completion_init(text: text)
+        let t_heat_end = DispatchTime.now().uptimeNanoseconds
+        let t_heat = Double(t_heat_end - t_start) / NS_PER_S
+        
+        messageLog += "\(text)"
+        
+        var tokenCount = 0
+        while await !llamaContext.is_done && tokenCount < 128 {
+            let result = await llamaContext.completion_loop()
+            await MainActor.run {
+                self.messageLog += "\(result)"
+            }
+            tokenCount += 1
+        }
+        
+        let t_end = DispatchTime.now().uptimeNanoseconds
+        let t_generation = Double(t_end - t_heat_end) / self.NS_PER_S
+        //        let tokens_per_second = Double(await llamaContext.n_len) / t_generation
+        let tokens_per_second = Double(tokenCount) / t_generation
+        
+        await llamaContext.clear()
+        
+        await MainActor.run {
+            self.messageLog += """
+                    \n
+                    Done
+                    Heat up took \(t_heat)s
+                    Generated \(tokens_per_second) t/s\n
+                    """
+        }
+    }
+    
     func bench() async {
         guard let llamaContext else {
             return
@@ -210,5 +251,43 @@ class LlamaState: ObservableObject {
 
         await llamaContext.clear()
         messageLog = ""
+    }
+}
+
+func upload_results(output: String, dataset_name: String, question_id: Int) async {
+    // Prepare JSON payload with raw output
+    let requestBody: [String: Any] = [
+        "raw_output": output, // Sending raw output to server
+    ]
+
+    // Prepare URL
+    let serverURL = "http://\(server_ip):\(server_port)/upload_result?dataset=\(dataset_name)&question=\(question_id)"
+    
+    guard let url = URL(string: serverURL) else {
+        print("Invalid URL")
+        return
+    }
+
+    // Send HTTP POST request
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+    do {
+        let jsonData = try JSONSerialization.data(withJSONObject: requestBody, options: [])
+        request.httpBody = jsonData
+
+        // Use the async/await API to properly wait for the response
+        let (_, response) = try await URLSession.shared.data(for: request)
+        
+        guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
+            print("Failed to upload results")
+            return
+        }
+
+        print("Results successfully uploaded")
+        
+    } catch {
+        print("Error uploading results: \(error.localizedDescription)")
     }
 }
